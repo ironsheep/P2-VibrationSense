@@ -1,0 +1,94 @@
+'' =================================================================================================
+''
+''   File....... lsm6dsl_test.spin2
+''   Purpose.... Bring-up test for isp_lsm6dsl: WHO_AM_I, then a few accel/gyro/temp samples
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''   Started.... 24 SEP 2026
+''
+''   {$P2}
+''
+'' =================================================================================================
+
+
+con { timing }
+
+  CLK_FREQ = 200_000_000                                        ' system freq as a constant
+  _clkfreq = CLK_FREQ                                           ' set system clock
+
+
+con { app io pins }
+
+  CLICK_BASE = 32                                               ' LSM6DSL Click adapter on P32-P47
+
+  SAMPLE_COUNT = 10
+
+
+  PROBE_KHZ = 1_000                                             ' slow clock for the mode probe
+
+
+obj
+
+  imu : "isp_lsm6dsl"
+  spi : "isp_spi"                                               ' used directly only by probeModes()
+
+
+var
+
+  long  raw[6]                                                  ' gx, gy, gz, ax, ay, az
+
+
+pub main() | n, t
+
+  probeModes()
+
+  if not imu.start(CLICK_BASE, 0)
+    debug("LSM6DSL not found: WHO_AM_I = ", uhex_byte(imu.startWhoAmI()))
+    debug("END_SESSION")
+    return
+
+  debug("LSM6DSL found: WHO_AM_I = ", uhex_byte(imu.startWhoAmI()))
+
+  imu.setAccel(imu.ODR_104HZ, imu.ACCEL_FS_2G)
+  imu.setGyro(imu.ODR_104HZ, imu.GYRO_FS_250DPS)
+
+  repeat n from 1 to SAMPLE_COUNT
+    repeat until (imu.status() & (imu.STATUS_XLDA | imu.STATUS_GDA)) == (imu.STATUS_XLDA | imu.STATUS_GDA)
+    imu.readAllRaw(@raw)
+    debug("#", udec_(n), " accel ug: ", sdec_(imu.accelMicroG(raw[3])), " ", sdec_(imu.accelMicroG(raw[4])), " ", sdec_(imu.accelMicroG(raw[5])), {
+      } "  gyro udps: ", sdec_(imu.gyroMicroDps(raw[0])), " ", sdec_(imu.gyroMicroDps(raw[1])), " ", sdec_(imu.gyroMicroDps(raw[2])))
+
+  t := imu.readTempRaw()
+  debug("temp raw: ", sdec(t), " (degC = 25 + raw/256)")
+
+  imu.stop()
+  debug("END_SESSION")
+
+
+pri probeModes() | mode, id, csPin, misoPin, misoIdle, misoSel
+
+'' Diagnostic: read WHO_AM_I in each SPI mode at PROBE_KHZ, and report MISO levels
+
+  csPin := CLICK_BASE + imu.CLICK_OFST_CS
+  misoPin := CLICK_BASE + imu.CLICK_OFST_MISO
+
+  pinh(csPin)
+  waitms(imu.TURN_ON_MS)
+  misoIdle := pinread(misoPin)                                  ' CS high: SDO should be high-Z
+  pinl(csPin)
+  waitus(5)
+  misoSel := pinread(misoPin)                                   ' CS low, before any clock
+  pinh(csPin)
+  debug("probe: MISO level CS-high=", udec_(misoIdle), " CS-low=", udec_(misoSel), "  INT=", udec_(pinread(CLICK_BASE + imu.CLICK_OFST_INT)))
+
+  repeat mode from spi.SPI_MODE_0 to spi.SPI_MODE_3
+    spi.start(misoPin, CLICK_BASE + imu.CLICK_OFST_MOSI, CLICK_BASE + imu.CLICK_OFST_SCK, PROBE_KHZ, mode)
+    waitus(10)
+    pinl(csPin)
+    spi.shiftout(spi.MSBFIRST, imu.REG_WHO_AM_I | imu.SPI_READ, 8)
+    id := spi.shiftin(spi.MSBFIRST, 8)
+    pinh(csPin)
+    spi.stop()
+    debug("probe: SPI mode ", udec_(mode), " WHO_AM_I = ", uhex_byte_(id))
+
+  pinf(csPin)

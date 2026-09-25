@@ -1,0 +1,296 @@
+'' =================================================================================================
+''
+''   File....... isp_piezo_capture.spin2
+''   Purpose.... Capture CT-timestamped, calibrated samples of the amplified piezo on a P2 ADC pin
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''               -- see below for terms of use
+''   E-mail..... stephen@ironsheep.biz
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+''   A dedicated cog runs the pin's ADC (SINC2 sampling, 8192 clocks per ADC reading =
+''   24.4 kHz at 200 MHz) and averages N consecutive readings into each stored sample,
+''   giving a sample rate of clkfreq / (8192 * N). The averaging also filters out content
+''   above the stored rate.
+''
+''   Calibration: the ADC is pointed at its pin group's GND (GIO) and 3.3 V (VIO), and pin
+''   readings are scaled between the two. After switching back to the pin, the piezo's
+''   output needs several ms to recover (measured ~7 ms), so calibration is done only while
+''   idle, followed by PIN_SETTLE_MS before the object reports ready.
+''
+''   Buffer record layout (packed, little-endian), SAMPLE_BYTES bytes each:
+''     +0  long  CT offset in system clocks from the first sample of the capture
+''     +4  long  sum of N raw ADC readings (use getSample() for microvolts)
+''
+'' =================================================================================================
+
+
+con { public }
+
+  SAMPLE_BYTES = 8
+
+  RATE_HZ_DEFAULT = 2000
+
+
+con { private }
+
+  #0, CMD_NONE, CMD_CAPTURE, CMD_STOPCAP, CMD_CALIBRATE, CMD_SHUTDOWN
+  #0, ST_OFF, ST_INIT, ST_READY, ST_CAPTURING, ST_FAILED
+
+  ADC_X          = %00_1101                                     ' SINC2 sampling, 2^13 clocks per reading
+  ADC_PERIOD     = 1 << 13
+  SETTLE_READS   = 3                                            ' discard after each ADC source switch
+  CAL_READS      = 256
+  PIN_SETTLE_MS  = 50
+  VIO_UV         = 3_300_000
+
+  STACK_LONGS = 128
+
+
+var
+
+  long  captureCogPlus1                                         ' cog + 1; 0 when not running
+  long  stack[STACK_LONGS]
+
+  long  adcPin
+  long  readsPerSample                                          ' N
+
+  long  cmd                                                     ' written by caller, cleared by cog
+  long  state                                                   ' written by cog
+
+  long  gioCounts                                               ' calibration, raw counts per reading
+  long  vioCounts
+
+  long  pBuf
+  long  maxSamples
+  long  count
+
+
+pub null()
+
+'' This is not a top object
+
+
+pub start(pin, sampleRateHz) : ok
+
+'' Launch the capture cog, calibrate the pin's ADC, and wait until ready to capture
+'' -- pin: the P2 pin wired to the piezo's signal output
+'' -- sampleRateHz: requested rate; the nearest clkfreq / (8192 * N) is used (see actualRateHz())
+''    0 selects RATE_HZ_DEFAULT
+
+  stop()
+
+  if sampleRateHz <= 0
+    sampleRateHz := RATE_HZ_DEFAULT
+  adcPin := pin
+  readsPerSample := 1 #> ((clkfreq / ADC_PERIOD + sampleRateHz / 2) / sampleRateHz)
+  count := 0
+  cmd := CMD_NONE
+  state := ST_INIT
+
+  captureCogPlus1 := cogspin(NEWCOG, captureCog(), @stack) + 1
+  if captureCogPlus1 == 0
+    return false
+
+  repeat while state == ST_INIT
+  if state <> ST_READY
+    stop()
+    return false
+
+  ok := true
+
+
+pub stop()
+
+'' Shut the capture cog down; it releases the pin itself
+
+  if captureCogPlus1
+    cmd := CMD_SHUTDOWN
+    repeat until state == ST_OFF
+    cogstop(captureCogPlus1 - 1)
+    captureCogPlus1 := 0
+
+
+pub recalibrate() : ok
+
+'' Re-measure GIO/VIO (only while idle); returns once the pin has settled again
+
+  if state <> ST_READY
+    return false
+  cmd := CMD_CALIBRATE
+  repeat while cmd == CMD_CALIBRATE
+  ok := true
+
+
+pub startCapture(pBuffer, nSamples) : ok
+
+'' Begin filling pBuffer with up to nSamples records (SAMPLE_BYTES each)
+'' -- returns false if not ready (not started, or a capture is already running)
+
+  if (state <> ST_READY) || (nSamples <= 0)
+    return false
+
+  pBuf := pBuffer
+  maxSamples := nSamples
+  count := 0
+  cmd := CMD_CAPTURE
+  repeat while cmd == CMD_CAPTURE                               ' cog accepts: state -> CAPTURING
+  ok := true
+
+
+pub stopCapture()
+
+'' End a capture early; returns once the cog has stopped writing
+
+  if state == ST_CAPTURING
+    cmd := CMD_STOPCAP
+    repeat while state == ST_CAPTURING
+
+
+pub isCapturing() : capturing
+
+'' True while samples are being written
+
+  capturing := (state == ST_CAPTURING)
+
+
+pub sampleCount() : n
+
+'' Number of records written so far in the current or last capture
+
+  n := count
+
+
+pub actualRateHz() : hz
+
+'' Stored sample rate, rounded to whole Hz; exact rate is clkfreq / samplePeriodClocks()
+
+  hz := (clkfreq + samplePeriodClocks() / 2) / samplePeriodClocks()
+
+
+pub samplePeriodClocks() : clocks
+
+'' Exact system clocks per stored sample
+
+  clocks := ADC_PERIOD * readsPerSample
+
+
+pub calibration() : gio, vio
+
+'' Raw ADC counts (per reading) for the pin group's GND and 3.3 V
+
+  gio := gioCounts
+  vio := vioCounts
+
+
+pub getSample(index) : ctOffset, microvolts | p
+
+'' Returns the CT offset (clocks since first sample) and calibrated voltage of record index
+
+  p := pBuf + index * SAMPLE_BYTES
+  ctOffset := long[p]
+  microvolts := sumToMicrovolts(long[p + 4])
+
+
+pub sumToMicrovolts(sum) : uv
+
+'' Convert a stored sum of N readings to microvolts against the GIO/VIO calibration
+
+  uv := muldiv64(sum - gioCounts * readsPerSample, VIO_UV, (vioCounts - gioCounts) * readsPerSample)
+
+
+pri captureCog() | t, t0, p, sum
+
+  calibrate()
+  state := ST_READY
+
+  repeat
+    case cmd
+      CMD_CAPTURE:
+        state := ST_CAPTURING
+        cmd := CMD_NONE
+        nextReading()                                           ' start on a fresh reading boundary
+        repeat while (count < maxSamples) && (cmd <> CMD_STOPCAP)
+          sum := 0
+          repeat readsPerSample
+            sum += nextReading()
+          t := getct()
+          if count == 0
+            t0 := t
+          p := pBuf + count * SAMPLE_BYTES
+          long[p] := t - t0
+          long[p + 4] := sum
+          count++
+        if cmd == CMD_STOPCAP
+          cmd := CMD_NONE
+        state := ST_READY
+
+      CMD_STOPCAP:
+        cmd := CMD_NONE
+
+      CMD_CALIBRATE:
+        calibrate()
+        cmd := CMD_NONE
+
+      CMD_SHUTDOWN:
+        pinclear(adcPin)                                        ' release the pin from the owning cog
+        state := ST_OFF
+        return
+
+
+pri calibrate()
+
+  gioCounts := averageSource(P_ADC_GIO)
+  vioCounts := averageSource(P_ADC_VIO)
+  selectSource(P_ADC_1X)
+  waitms(PIN_SETTLE_MS)                                         ' piezo output recovers after the switch
+
+
+pri averageSource(source) : avg | sum
+
+  selectSource(source)
+  sum := 0
+  repeat CAL_READS
+    sum += nextReading()
+  avg := (sum + CAL_READS / 2) / CAL_READS
+
+
+pri selectSource(source)
+
+  pinstart(adcPin, P_ADC | source, ADC_X, 0)
+  repeat SETTLE_READS
+    nextReading()
+
+
+pri nextReading() : value
+
+  repeat until pinr(adcPin)
+  value := rdpin(adcPin)
+
+
+con { license }
+
+{{
+
+  Terms of Use: MIT License
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify,
+  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following
+  conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies
+  or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+  OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+}}

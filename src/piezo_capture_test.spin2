@@ -1,0 +1,95 @@
+'' =================================================================================================
+''
+''   File....... piezo_capture_test.spin2
+''   Purpose.... Hardware test for isp_piezo_capture: a ~1 s capture at 2 kHz; reports measured
+''               rate, sample-interval jitter, resting level and noise
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+'' =================================================================================================
+
+
+con { timing }
+
+  CLK_FREQ = 200_000_000                                        ' system freq as a constant
+  _clkfreq = CLK_FREQ                                           ' set system clock
+
+
+con { app io pins }
+
+  PIEZO_PIN = 0
+
+
+con { test settings }
+
+  RATE_HZ         = 2000
+  CAPTURE_SAMPLES = 2048
+
+
+obj
+
+  piezo : "isp_piezo_capture"
+
+
+var
+
+  byte  buf[CAPTURE_SAMPLES * piezo.SAMPLE_BYTES]
+
+
+pub main() | n, i, t, uv, prev, dt, dtMin, dtMax, late, gio, vio, sum, meanF, dev, sumSq, minUv, maxUv
+
+  if not piezo.start(PIEZO_PIN, RATE_HZ)
+    debug("piezo start FAILED")
+    finish()
+    return
+
+  gio, vio := piezo.calibration()
+  debug("piezo: ", udec_(piezo.actualRateHz()), " Hz (", udec_(piezo.samplePeriodClocks()), " clocks/sample)  GIO=", udec_(gio), " VIO=", udec_(vio))
+
+  piezo.startCapture(@buf, CAPTURE_SAMPLES)
+  repeat while piezo.isCapturing()
+  n := piezo.sampleCount()
+
+  dtMin := posx
+  dtMax := 0
+  late := 0
+  prev := 0
+  sum := 0.0
+  minUv := posx
+  maxUv := negx
+  repeat i from 0 to n - 1
+    t, uv := piezo.getSample(i)
+    sum := sum +. float(uv)
+    minUv <#= uv
+    maxUv #>= uv
+    if i > 0
+      dt := t - prev
+      dtMin <#= dt
+      dtMax #>= dt
+      if dt > piezo.samplePeriodClocks() * 3 / 2
+        late++
+    prev := t
+  meanF := sum /. float(n)
+
+  sumSq := 0.0
+  repeat i from 0 to n - 1
+    t, uv := piezo.getSample(i)
+    dev := float(uv) -. meanF
+    sumSq := sumSq +. dev *. dev
+
+  debug("samples=", udec_(n), "  measured rate=", fdec_(float(n - 1) /. (float(prev) /. float(clkfreq))), " Hz", {
+    } "  interval us min/max=", udec_(dtMin / (clkfreq / 1_000_000)), "/", udec_(dtMax / (clkfreq / 1_000_000)), "  missed=", udec_(late))
+  debug("level=", fdec_(meanF /. 1000.0), " mV  noise RMS=", fdec_(fsqrt(sumSq /. float(n)) /. 1000.0), " mV", {
+    } "  min/max=", fdec_(float(minUv) /. 1000.0), "/", fdec_(float(maxUv) /. 1000.0), " mV")
+
+  piezo.stop()
+  finish()
+
+
+pri finish()
+
+  waitms(100)
+  debug("END_SESSION")

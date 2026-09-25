@@ -1,0 +1,175 @@
+'' =================================================================================================
+''
+''   File....... piezo_thump_test.spin2
+''   Purpose.... Characterize the piezo's response to a desk thump: calibrate P0's ADC, wait for
+''               the signal to leave its resting level, capture 1 s, then report peak swing,
+''               ring-down time and a zero-crossing frequency estimate
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+'' =================================================================================================
+
+
+con { timing }
+
+  CLK_FREQ = 200_000_000                                        ' system freq as a constant
+  _clkfreq = CLK_FREQ                                           ' set system clock
+
+
+con { app io pins }
+
+  PIEZO_PIN = 0
+
+
+con { test settings }
+
+  ADC_X           = %00_1101                                    ' SINC2 sampling, 8192 clocks/sample
+  ADC_PERIOD      = 1 << 13
+  SAMPLE_HZ       = CLK_FREQ / ADC_PERIOD                       ' 24_414
+  SETTLE_SAMPLES  = 3
+  CAL_SAMPLES     = 64
+  PIN_SETTLE_MS   = 50                                          ' P0 recovers ~7 ms after a source switch
+  REST_SAMPLES    = 2048
+  TRIGGER_MV      = 30                                          ' leave rest by this much to trigger
+  WAIT_S          = 30
+  CAPTURE_SAMPLES = SAMPLE_HZ                                   ' 1 s
+  HYST_MV         = 5                                           ' zero-crossing hysteresis
+  FREQ_WINDOW_MS  = 200
+
+  VIO_MV = 3300
+
+
+var
+
+  long  samples[CAPTURE_SAMPLES]
+  long  gio, span, rest
+
+
+pub main() | i, deadline, v, trig, maxDev, minDev, peakIdx, dev
+
+  gio := averageSource(P_ADC_GIO, CAL_SAMPLES)
+  span := averageSource(P_ADC_VIO, CAL_SAMPLES) - gio
+  selectSource(P_ADC_1X)
+  waitms(PIN_SETTLE_MS)
+  rest := 0
+  repeat REST_SAMPLES
+    rest += nextSample()
+  rest /= REST_SAMPLES
+  trig := TRIGGER_MV * span / VIO_MV
+  debug("rest = ", udec_(toMv(rest)), " mV; waiting up to ", udec_(WAIT_S), " s for a thump (> ", udec_(TRIGGER_MV), " mV)...")
+
+  deadline := getct() + WAIT_S * clkfreq
+  repeat
+    v := nextSample()
+    if abs (v - rest) > trig
+      quit
+    if (getct() - deadline) > 0
+      debug("no thump seen")
+      finish()
+      return
+
+  samples[0] := v
+  repeat i from 1 to CAPTURE_SAMPLES - 1
+    samples[i] := nextSample()
+  pinclear(PIEZO_PIN)
+
+  maxDev := negx
+  minDev := posx
+  repeat i from 0 to CAPTURE_SAMPLES - 1
+    dev := samples[i] - rest
+    if dev > maxDev
+      maxDev := dev
+      peakIdx := i
+    minDev <#= dev
+  debug("peak swing: +", udec_(maxDev * VIO_MV / span), " / ", sdec_(minDev * VIO_MV / span), " mV around rest", {
+    } " (max at ", udec_(peakIdx * 1000 / SAMPLE_HZ), " ms)  raw min/max ", udec_(toMv(rest + minDev)), "/", udec_(toMv(rest + maxDev)), " mV")
+
+  reportRingDown(maxDev #> -minDev)
+  reportFrequency()
+  reportEnvelope()
+  finish()
+
+
+pri reportRingDown(peakDev) | i, lastBig, limit
+
+'' Time after trigger until the signal stays within 10% of its peak swing
+
+  limit := peakDev / 10
+  lastBig := 0
+  repeat i from 0 to CAPTURE_SAMPLES - 1
+    if abs (samples[i] - rest) > limit
+      lastBig := i
+  debug("ring-down to 10% of peak: ", udec_(lastBig * 1000 / SAMPLE_HZ), " ms")
+
+
+pri reportFrequency() | i, n, hyst, state, crossings, first, last
+
+'' Estimate the dominant frequency from rising zero crossings in the first FREQ_WINDOW_MS
+
+  n := SAMPLE_HZ * FREQ_WINDOW_MS / 1000
+  hyst := HYST_MV * span / VIO_MV
+  state := 0
+  crossings := 0
+  repeat i from 0 to n - 1
+    if samples[i] - rest > hyst
+      if state < 0
+        if crossings == 0
+          first := i
+        last := i
+        crossings++
+      state := 1
+    elseif samples[i] - rest < -hyst
+      state := -1
+  if crossings > 1
+    debug("dominant frequency (first ", udec_(FREQ_WINDOW_MS), " ms): ~", udec_((crossings - 1) * SAMPLE_HZ / (last - first)), " Hz from ", udec_(crossings), " cycles")
+  else
+    debug("too few crossings for a frequency estimate (", udec_(crossings), ")")
+
+
+pri reportEnvelope() | seg, i, peak, segLen
+
+'' Peak |deviation| in each 50 ms segment: shows the decay shape
+
+  segLen := SAMPLE_HZ / 20
+  repeat seg from 0 to 9
+    peak := 0
+    repeat i from seg * segLen to seg * segLen + segLen - 1
+      peak #>= abs (samples[i] - rest)
+    debug("  ", udec_(seg * 50), "-", udec_(seg * 50 + 50), " ms: peak ", udec_(peak * VIO_MV / span), " mV")
+
+
+pri finish()
+
+  pinclear(PIEZO_PIN)
+  waitms(100)
+  debug("END_SESSION")
+
+
+pri averageSource(source, count) : avg | sum
+
+  selectSource(source)
+  sum := 0
+  repeat count
+    sum += nextSample()
+  avg := sum / count
+
+
+pri selectSource(source)
+
+  pinstart(PIEZO_PIN, P_ADC | source, ADC_X, 0)
+  repeat SETTLE_SAMPLES
+    nextSample()
+
+
+pri nextSample() : value
+
+  repeat until pinr(PIEZO_PIN)
+  value := rdpin(PIEZO_PIN)
+
+
+pri toMv(counts) : mv
+
+  mv := (counts - gio) * VIO_MV / span

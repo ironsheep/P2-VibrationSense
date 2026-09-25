@@ -1,0 +1,123 @@
+'' =================================================================================================
+''
+''   File....... imu_capture_test.spin2
+''   Purpose.... Hardware test for isp_imu_capture: 1 s captures, accel-only then accel+gyro;
+''               reports measured rate, sample-interval jitter, and per-axis mean / RMS / peak
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+'' =================================================================================================
+
+
+con { timing }
+
+  CLK_FREQ = 200_000_000                                        ' system freq as a constant
+  _clkfreq = CLK_FREQ                                           ' set system clock
+
+
+con { app io pins }
+
+  CLICK_BASE = 32                                               ' LSM6DSL Click adapter on P32-P47
+
+
+con { test settings }
+
+  RATE_HZ         = 1660
+  CAPTURE_SAMPLES = 1660                                        ' ~1 s
+
+
+obj
+
+  imu : "isp_imu_capture"
+
+
+var
+
+  byte  buf[CAPTURE_SAMPLES * imu.SAMPLE_BYTES_ACCEL_GYRO]
+
+
+pub main()
+
+  runCapture(false)
+  runCapture(true)
+  waitms(100)
+  debug("END_SESSION")
+
+
+pri runCapture(withGyro) | n, i, t, prev, dt, dtMin, dtMax, late, v[3], axis
+
+  if not imu.start(CLICK_BASE, RATE_HZ, imu.ACCEL_FS_4G, withGyro)
+    debug("capture start FAILED (gyro=", udec_(withGyro ? 1 : 0), ")")
+    return
+
+  debug("--- capture: ", udec_(imu.actualRateHz()), " Hz nominal, gyro=", udec_(withGyro ? 1 : 0), ", ", udec_(imu.sampleBytes()), " bytes/sample")
+
+  imu.startCapture(@buf, CAPTURE_SAMPLES)
+  repeat while imu.isCapturing()
+  n := imu.sampleCount()
+
+  ' sample spacing from the CT offsets
+  dtMin := posx
+  dtMax := 0
+  late := 0
+  prev := 0
+  repeat i from 1 to n - 1
+    t, v[0], v[1], v[2] := imu.getSample(i)
+    dt := t - prev
+    prev := t
+    dtMin <#= dt
+    dtMax #>= dt
+    if dt > (clkfreq / RATE_HZ) * 3 / 2                         ' > 1.5 periods: a sample was missed
+      late++
+  debug("samples=", udec_(n), "  measured rate=", fdec_(float(n - 1) /. (float(prev) /. float(clkfreq))), " Hz", {
+    } "  interval us min/max=", udec_(dtMin / (clkfreq / 1_000_000)), "/", udec_(dtMax / (clkfreq / 1_000_000)), "  missed=", udec_(late))
+
+  repeat axis from 0 to 2
+    reportAxis(axis, n, false)
+  if withGyro
+    repeat axis from 0 to 2
+      reportAxis(axis, n, true)
+
+  imu.stop()
+
+
+pri reportAxis(axis, n, isGyro) | i, t, v[3], sum, mean, dev, sumSq, peak, scale
+
+  sum := 0.0
+  repeat i from 0 to n - 1
+    sampleAxes(i, isGyro, @v)
+    sum := sum +. float(v[axis])
+  mean := sum /. float(n)
+
+  sumSq := 0.0
+  peak := 0.0
+  repeat i from 0 to n - 1
+    sampleAxes(i, isGyro, @v)
+    dev := float(v[axis]) -. mean
+    sumSq := sumSq +. dev *. dev
+    peak := peak #> fabs(dev)
+
+  if isGyro
+    scale := float(imu.gyroMicroDps(1)) /. 1_000.0              ' mdps per count
+    debug("  gyro ", zstr_(@axisNames + axis * 2), " mean=", fdec_(mean *. scale), " mdps  RMS=", fdec_(fsqrt(sumSq /. float(n)) *. scale), {
+      } " mdps  peak=", fdec_(peak *. scale), " mdps")
+  else
+    scale := float(imu.accelMicroG(1)) /. 1_000.0               ' mg per count
+    debug("  accel ", zstr_(@axisNames + axis * 2), " mean=", fdec_(mean *. scale), " mg  RMS=", fdec_(fsqrt(sumSq /. float(n)) *. scale), {
+      } " mg  peak=", fdec_(peak *. scale), " mg")
+
+
+pri sampleAxes(i, isGyro, pV) | t
+
+  if isGyro
+    long[pV][0], long[pV][1], long[pV][2] := imu.getGyro(i)
+  else
+    t, long[pV][0], long[pV][1], long[pV][2] := imu.getSample(i)
+
+
+dat
+
+  axisNames     byte    "X", 0, "Y", 0, "Z", 0

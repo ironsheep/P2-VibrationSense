@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code / todo-mcp
+.claude/
+.todo-mcp/
+CLAUDE.md
+CLAUDE.local.md
+
+# macOS
+.DS_Store
+
+# P2 build output and pnut-term-ts run logs
+*.bin
+logs/

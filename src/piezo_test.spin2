@@ -1,0 +1,146 @@
+'' =================================================================================================
+''
+''   File....... piezo_test.spin2
+''   Purpose.... Bring-up test for the amplified piezo on P0: calibrate the pin's ADC against its
+''               power group's GND (GIO) and 3.3 V (VIO), then capture a burst and report the
+''               resting level, noise and swing in mV
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+'' =================================================================================================
+
+
+con { timing }
+
+  CLK_FREQ = 200_000_000                                        ' system freq as a constant
+  _clkfreq = CLK_FREQ                                           ' set system clock
+
+
+con { app io pins }
+
+  PIEZO_PIN = 0
+
+
+con { test settings }
+
+  ADC_X          = %00_1101                                     ' SINC2 sampling, 2^13 = 8192 clocks/sample
+  ADC_PERIOD     = 1 << 13
+  SETTLE_SAMPLES = 3                                            ' discard after each source switch
+  CAL_SAMPLES    = 64
+  CAPTURE_SAMPLES = 4096
+
+  VIO_MV = 3300
+
+
+var
+
+  long  samples[CAPTURE_SAMPLES]
+
+
+pub main() | gio, vio, i, sum, minV, maxV, meanF, dev, sumSq, span
+
+  debug("piezo on P", udec_(PIEZO_PIN), ": ADC SINC2 ", udec_(ADC_PERIOD), " clocks/sample = ", udec_(clkfreq / ADC_PERIOD), " Hz")
+
+  gio := averageSource(P_ADC_GIO)
+  vio := averageSource(P_ADC_VIO)
+  span := vio - gio
+  debug("calibration: GIO=", udec_(gio), " VIO=", udec_(vio), " counts (span ", udec_(span), ")")
+
+  selectSource(P_ADC_1X)
+  repeat i from 0 to CAPTURE_SAMPLES - 1                        ' first capture: right after the switch
+    samples[i] := nextSample()
+  reportOutliers(gio, span, averageCounts())
+
+  waitms(50)                                                    ' second capture: after 50 ms on the pin
+  repeat i from 0 to CAPTURE_SAMPLES - 1
+    samples[i] := nextSample()
+  pinclear(PIEZO_PIN)
+  debug("--- capture after 50 ms on the pin:")
+
+  sum := 0
+  minV := posx
+  maxV := negx
+  repeat i from 0 to CAPTURE_SAMPLES - 1
+    sum += samples[i]
+    minV <#= samples[i]
+    maxV #>= samples[i]
+  meanF := float(sum) /. float(CAPTURE_SAMPLES)
+
+  sumSq := 0.0
+  repeat i from 0 to CAPTURE_SAMPLES - 1
+    dev := float(samples[i]) -. meanF
+    sumSq := sumSq +. dev *. dev
+
+  debug("P0 resting level = ", fdec_(countsToMv(meanF, gio, span)), " mV", {
+    } "  noise RMS = ", fdec_(fsqrt(sumSq /. float(CAPTURE_SAMPLES)) *. float(VIO_MV) /. float(span)), " mV")
+  debug("P0 min/max = ", fdec_(countsToMv(float(minV), gio, span)), " / ", fdec_(countsToMv(float(maxV), gio, span)), " mV", {
+    } "  (", udec_(CAPTURE_SAMPLES), " samples over ", udec_(CAPTURE_SAMPLES * 1000 / (clkfreq / ADC_PERIOD)), " ms)")
+
+  reportOutliers(gio, span, meanF)
+
+  waitms(100)
+  debug("END_SESSION")
+
+
+pri reportOutliers(gio, span, meanF) | i, lowCount, limit
+
+'' Diagnostic: list samples more than 200 mV below the mean, and the first 8 samples
+
+  debug("first 8 samples (mV): ", fdec_(countsToMv(float(samples[0]), gio, span)), " ", fdec_(countsToMv(float(samples[1]), gio, span)), " ", {
+    } fdec_(countsToMv(float(samples[2]), gio, span)), " ", fdec_(countsToMv(float(samples[3]), gio, span)), " ", {
+    } fdec_(countsToMv(float(samples[4]), gio, span)), " ", fdec_(countsToMv(float(samples[5]), gio, span)), " ", {
+    } fdec_(countsToMv(float(samples[6]), gio, span)), " ", fdec_(countsToMv(float(samples[7]), gio, span)))
+  limit := trunc(meanF) - (200 * span / VIO_MV)
+  lowCount := 0
+  repeat i from 0 to CAPTURE_SAMPLES - 1
+    if samples[i] < limit
+      if lowCount < 10
+        debug("  low sample #", udec_(i), " = ", fdec_(countsToMv(float(samples[i]), gio, span)), " mV")
+      lowCount++
+  debug("samples >200 mV below mean: ", udec_(lowCount))
+
+
+pri averageCounts() : meanF | i, sum
+
+  sum := 0
+  repeat i from 0 to CAPTURE_SAMPLES - 1
+    sum += samples[i]
+  meanF := float(sum) /. float(CAPTURE_SAMPLES)
+
+
+pri averageSource(source) : avg | sum
+
+'' Average CAL_SAMPLES readings of an ADC source (after settling)
+
+  selectSource(source)
+  sum := 0
+  repeat CAL_SAMPLES
+    sum += nextSample()
+  avg := sum / CAL_SAMPLES
+
+
+pri selectSource(source)
+
+'' Point P0's ADC at source (P_ADC_GIO / P_ADC_VIO / P_ADC_1X) and let the filter settle
+
+  pinstart(PIEZO_PIN, P_ADC | source, ADC_X, 0)
+  repeat SETTLE_SAMPLES
+    nextSample()
+
+
+pri nextSample() : value
+
+'' Wait for and return the next completed ADC sample
+
+  repeat until pinr(PIEZO_PIN)
+  value := rdpin(PIEZO_PIN)
+
+
+pri countsToMv(counts, gio, span) : mv
+
+'' Float counts -> float millivolts against the GIO/VIO calibration
+
+  mv := (counts -. float(gio)) *. float(VIO_MV) /. float(span)

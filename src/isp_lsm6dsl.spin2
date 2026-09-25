@@ -1,0 +1,367 @@
+'' =================================================================================================
+''
+''   File....... isp_lsm6dsl.spin2
+''   Purpose.... LSM6DSL 6DOF IMU (MikroE LSM6DSL Click) register-level driver over SPI
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''               -- see below for terms of use
+''   E-mail..... stephen@ironsheep.biz
+''   Started.... 24 SEP 2026
+''
+''   {$P2}
+''
+''   Sits on top of isp_spi (smart pin SPI, run here in mode 3). Pins are
+''   addressed as Click-adapter offsets from a base pin (see HARDWARE.md).
+''
+''   IMPORTANT: every method here drives smart pins and CS from the CALLING cog.
+''   start() and all later calls must be made from the same cog, because P2 cogs'
+''   OUT/DIR registers are OR'ed at the pins.
+''
+''   Register addresses and field encodings verified against the ST LSM6DSL
+''   datasheet, DocID028475 Rev 7 (DOCs/hardware/DS_lsm6dsl.pdf).
+''   The datasheet documents SPI mode 3 only (clock idles high, data captured
+''   on the rising edge), up to 10 MHz.
+''
+'' =================================================================================================
+
+
+con { click adapter offsets from base pin }
+
+  CLICK_OFST_INT  = 4                                           ' LSM6DSL INT1 or INT2 (JP4)
+  CLICK_OFST_CS   = 8
+  CLICK_OFST_SCK  = 9
+  CLICK_OFST_MISO = 10                                          ' LSM6DSL SDO
+  CLICK_OFST_MOSI = 11                                          ' LSM6DSL SDI
+
+
+con { registers }
+
+  REG_DRDY_PULSE_CFG_G = $0B
+  REG_INT1_CTRL        = $0D
+  REG_WHO_AM_I         = $0F
+  REG_CTRL1_XL         = $10
+  REG_CTRL2_G          = $11
+  REG_CTRL3_C          = $12
+  REG_CTRL4_C          = $13
+  REG_STATUS           = $1E
+  REG_OUT_TEMP_L       = $20
+  REG_OUTX_L_G         = $22                                    ' gyro X/Y/Z, then accel X/Y/Z
+  REG_OUTX_L_XL        = $28
+
+  WHO_AM_I_VALUE       = $6A
+
+  SPI_READ             = $80                                    ' address bit 7 = read
+
+
+con { register fields }
+
+  CTRL3_BOOT           = %1000_0000
+  CTRL3_BDU            = %0100_0000                             ' block data update
+  CTRL3_IF_INC         = %0000_0100                             ' auto-increment address
+  CTRL3_SW_RESET       = %0000_0001
+
+  CTRL4_I2C_DISABLE    = %0000_0100
+
+  INT1_DRDY_XL         = %0000_0001
+  INT1_DRDY_G          = %0000_0010
+
+  DRDY_PULSED          = %1000_0000                             ' 75 us pulses instead of latched
+
+  STATUS_XLDA          = %0000_0001                             ' accel data available
+  STATUS_GDA           = %0000_0010                             ' gyro data available
+  STATUS_TDA           = %0000_0100                             ' temperature data available
+
+
+con { user settings }
+
+  ' output data rates (register ODR field values)
+  #0, ODR_OFF, ODR_12_5HZ, ODR_26HZ, ODR_52HZ, ODR_104HZ, ODR_208HZ, ODR_416HZ, ODR_833HZ, {
+    } ODR_1_66KHZ, ODR_3_33KHZ, ODR_6_66KHZ
+
+  ' accelerometer full scale
+  #0, ACCEL_FS_2G, ACCEL_FS_4G, ACCEL_FS_8G, ACCEL_FS_16G
+
+  ' gyroscope full scale
+  #0, GYRO_FS_125DPS, GYRO_FS_250DPS, GYRO_FS_500DPS, GYRO_FS_1000DPS, GYRO_FS_2000DPS
+
+  SPI_KHZ_DEFAULT = 5_000                                       ' LSM6DSL SPI max is 10 MHz
+  LSM6DSL_SPI_MODE = spi.SPI_MODE_3                             ' the only mode the datasheet documents
+
+  TURN_ON_MS      = 35                                          ' datasheet Ton
+
+
+obj
+
+  spi : "isp_spi"
+
+
+var
+
+  long  csPin
+  long  intPin
+  long  accelUgPerLsb                                           ' micro-g per LSB
+  long  gyroUdpsPerLsb                                          ' micro-dps per LSB
+  long  startId                                                 ' WHO_AM_I value read by start()
+  byte  isStarted
+
+
+pub null()
+
+'' This is not a top object
+
+
+pub start(basePin, spiKhz) : ok
+
+'' Configure SPI on the Click adapter at basePin, reset the LSM6DSL and verify it
+'' -- basePin is the adapter's pin group base (0, 16, 32 or 48)
+'' -- spiKhz is the SPI clock in kHz (<= 10_000); 0 selects SPI_KHZ_DEFAULT
+'' -- returns true if WHO_AM_I reads back correctly
+
+  stop()
+
+  if spiKhz <= 0
+    spiKhz := SPI_KHZ_DEFAULT
+
+  csPin := basePin + CLICK_OFST_CS
+  intPin := basePin + CLICK_OFST_INT
+
+  pinh(csPin)                                                   ' deselect before bus comes up
+  if not spi.start(basePin + CLICK_OFST_MISO, basePin + CLICK_OFST_MOSI, basePin + CLICK_OFST_SCK, spiKhz, LSM6DSL_SPI_MODE)
+    pinf(csPin)
+    return false
+  isStarted := true
+
+  waitms(TURN_ON_MS)                                            ' in case we're called right after power-up
+
+  startId := whoAmI()
+  if startId <> WHO_AM_I_VALUE
+    stop()
+    return false
+
+  reset()
+  writeReg(REG_CTRL3_C, CTRL3_BDU | CTRL3_IF_INC)
+  writeReg(REG_CTRL4_C, CTRL4_I2C_DISABLE)                      ' SPI only; keeps I2C logic off the bus
+
+  setAccel(ODR_OFF, ACCEL_FS_2G)
+  setGyro(ODR_OFF, GYRO_FS_250DPS)
+
+  ok := true
+
+
+pub stop()
+
+'' Power down the sensor outputs and release the pins
+
+  if isStarted
+    writeReg(REG_CTRL1_XL, 0)
+    writeReg(REG_CTRL2_G, 0)
+    spi.stop()
+    pinf(csPin)
+    isStarted := false
+
+
+pub reset() | tries
+
+'' Software reset; restores all registers to their defaults
+
+  writeReg(REG_CTRL3_C, CTRL3_SW_RESET)
+  repeat tries from 1 to 100                                    ' reset completes in ~50 us
+    waitus(10)
+    if (readReg(REG_CTRL3_C) & CTRL3_SW_RESET) == 0
+      quit
+
+
+pub whoAmI() : id
+
+'' Returns the device ID; $6A for an LSM6DSL
+
+  id := readReg(REG_WHO_AM_I)
+
+
+pub startWhoAmI() : id
+
+'' Returns the WHO_AM_I value start() read (valid even after a failed start)
+
+  id := startId
+
+
+pub setAccel(odr, fs) | fsBits
+
+'' Set accelerometer output data rate (ODR_*) and full scale (ACCEL_FS_*)
+'' -- analog anti-alias filter left at its default (1.5 kHz)
+
+  fs := 0 #> fs <# ACCEL_FS_16G
+  fsBits := lookupz(fs : %00, %10, %11, %01)                    ' FS_XL encoding is not in order
+  accelUgPerLsb := lookupz(fs : 61, 122, 244, 488)
+  writeReg(REG_CTRL1_XL, (odr & $F) << 4 | fsBits << 2)
+
+
+pub setGyro(odr, fs) | fsBits
+
+'' Set gyroscope output data rate (ODR_*) and full scale (GYRO_FS_*)
+
+  fs := 0 #> fs <# GYRO_FS_2000DPS
+  fsBits := lookupz(fs : %0010, %0000, %0100, %1000, %1100)      ' FS_125 bit, then FS_G[1:0]
+  gyroUdpsPerLsb := lookupz(fs : 4_375, 8_750, 17_500, 35_000, 70_000)
+  writeReg(REG_CTRL2_G, (odr & $F) << 4 | fsBits)
+
+
+pub setDataReadyInt1(onAccel, onGyro, pulsed) | ctrl
+
+'' Route data-ready to INT1 (Click INT pin with JP4 in its default position)
+'' -- pulsed: true for 75 us pulses; false for a level that clears when the data is read
+
+  ctrl := 0
+  if onAccel
+    ctrl |= INT1_DRDY_XL
+  if onGyro
+    ctrl |= INT1_DRDY_G
+  writeReg(REG_DRDY_PULSE_CFG_G, pulsed ? DRDY_PULSED : 0)
+  writeReg(REG_INT1_CTRL, ctrl)
+
+
+pub intPinNumber() : pin
+
+'' Returns the P2 pin wired to the Click INT line
+
+  pin := intPin
+
+
+pub status() : bits
+
+'' Returns STATUS_REG (STATUS_XLDA / STATUS_GDA / STATUS_TDA)
+
+  bits := readReg(REG_STATUS)
+
+
+pub readAccelRaw() : x, y, z
+
+'' Returns raw signed accelerometer counts
+
+  x, y, z := readAxes3(REG_OUTX_L_XL)
+
+
+pub readGyroRaw() : x, y, z
+
+'' Returns raw signed gyroscope counts
+
+  x, y, z := readAxes3(REG_OUTX_L_G)
+
+
+pub readAllRaw(pSix) | l0, l1, l2
+
+'' Burst-read gyro X/Y/Z then accel X/Y/Z as raw signed counts
+'' -- pSix points to 6 longs: gx, gy, gz, ax, ay, az
+
+  pinl(csPin)
+  spi.shiftout(spi.MSBFIRST, REG_OUTX_L_G | SPI_READ, 8)
+  l0 := spi.shiftin(spi.MSBFIRST, 32)                           ' 12 bytes as three longs
+  l1 := spi.shiftin(spi.MSBFIRST, 32)
+  l2 := spi.shiftin(spi.MSBFIRST, 32)
+  pinh(csPin)
+
+  long[pSix][0] := word16(l0.byte[3], l0.byte[2])               ' first byte received is in [31:24]
+  long[pSix][1] := word16(l0.byte[1], l0.byte[0])
+  long[pSix][2] := word16(l1.byte[3], l1.byte[2])
+  long[pSix][3] := word16(l1.byte[1], l1.byte[0])
+  long[pSix][4] := word16(l2.byte[3], l2.byte[2])
+  long[pSix][5] := word16(l2.byte[1], l2.byte[0])
+
+
+pub readTempRaw() : t
+
+'' Returns raw temperature; 256 LSB per degC, 0 = 25 degC
+
+  pinl(csPin)
+  spi.shiftout(spi.MSBFIRST, REG_OUT_TEMP_L | SPI_READ, 8)
+  t := spi.shiftin(spi.MSBFIRST, 16)
+  pinh(csPin)
+  t := word16(t.byte[1], t.byte[0])
+
+
+pub accelMicroG(raw) : ug
+
+'' Convert raw accelerometer counts to micro-g at the current full scale
+
+  ug := raw * accelUgPerLsb
+
+
+pub gyroMicroDps(raw) : udps
+
+'' Convert raw gyroscope counts to micro-degrees/second at the current full scale
+
+  udps := raw * gyroUdpsPerLsb
+
+
+pub readReg(regAddr) : value
+
+'' Read one register
+
+  pinl(csPin)
+  spi.shiftout(spi.MSBFIRST, regAddr | SPI_READ, 8)
+  value := spi.shiftin(spi.MSBFIRST, 8)
+  pinh(csPin)
+
+
+pub readRegs(regAddr, pBuf, count)
+
+'' Read count consecutive registers into bytes at pBuf (needs CTRL3_IF_INC, set by start())
+
+  pinl(csPin)
+  spi.shiftout(spi.MSBFIRST, regAddr | SPI_READ, 8)
+  repeat count
+    byte[pBuf++] := spi.shiftin(spi.MSBFIRST, 8)
+  pinh(csPin)
+
+
+pub writeReg(regAddr, value)
+
+'' Write one register
+
+  pinl(csPin)
+  spi.shiftout(spi.MSBFIRST, (regAddr & $7F) << 8 | (value & $FF), 16)
+  pinh(csPin)
+
+
+pri readAxes3(regAddr) : x, y, z | l0, l1
+
+  pinl(csPin)
+  spi.shiftout(spi.MSBFIRST, regAddr | SPI_READ, 8)
+  l0 := spi.shiftin(spi.MSBFIRST, 32)                           ' X_L X_H Y_L Y_H
+  l1 := spi.shiftin(spi.MSBFIRST, 16)                           ' Z_L Z_H
+  pinh(csPin)
+
+  x := word16(l0.byte[3], l0.byte[2])
+  y := word16(l0.byte[1], l0.byte[0])
+  z := word16(l1.byte[1], l1.byte[0])
+
+
+pri word16(lowByte, highByte) : value
+
+  value := (highByte << 8 | lowByte) signx 15
+
+
+con { license }
+
+{{
+
+  Terms of Use: MIT License
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify,
+  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following
+  conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies
+  or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+  OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+}}

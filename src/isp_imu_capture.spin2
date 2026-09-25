@@ -1,0 +1,315 @@
+'' =================================================================================================
+''
+''   File....... isp_imu_capture.spin2
+''   Purpose.... Capture CT-timestamped LSM6DSL accel (and optional gyro) samples into a buffer
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''               -- see below for terms of use
+''   E-mail..... stephen@ironsheep.biz
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+''   A dedicated cog owns the LSM6DSL Click's SPI pins (isp_lsm6dsl / isp_spi must
+''   be driven from one cog). It paces itself off the sensor's data-ready signal
+''   on the Click INT pin, stamps each sample with CT, and writes it to the
+''   caller's buffer. The public methods below may be called from any cog.
+''
+''   Buffer record layout (packed, little-endian), SAMPLE_BYTES_* bytes each:
+''     +0  long  CT offset in system clocks from the first sample of the capture
+''     +4  word  accel X, Y, Z (raw signed counts)
+''     +10 word  gyro X, Y, Z  (raw signed counts; only when gyro is enabled)
+''
+'' =================================================================================================
+
+
+con { public }
+
+  SAMPLE_BYTES_ACCEL      = 10
+  SAMPLE_BYTES_ACCEL_GYRO = 16
+
+  RATE_HZ_DEFAULT = 1660
+
+  ' accelerometer full scale (same values as isp_lsm6dsl)
+  ACCEL_FS_2G  = lsm.ACCEL_FS_2G
+  ACCEL_FS_4G  = lsm.ACCEL_FS_4G
+  ACCEL_FS_8G  = lsm.ACCEL_FS_8G
+  ACCEL_FS_16G = lsm.ACCEL_FS_16G
+
+
+con { private }
+
+  #0, CMD_NONE, CMD_CAPTURE, CMD_STOPCAP, CMD_SHUTDOWN
+  #0, ST_OFF, ST_INIT, ST_READY, ST_CAPTURING, ST_FAILED
+
+  SETTLE_MS   = 100                                             ' let accel/gyro settle after enabling
+  STACK_LONGS = 256
+
+
+obj
+
+  lsm : "isp_lsm6dsl"
+
+
+var
+
+  long  captureCogPlus1                                         ' cog + 1; 0 when not running
+  long  stack[STACK_LONGS]
+
+  long  basePin                                                 ' settings passed to the capture cog
+  long  odr
+  long  accelFs
+  long  gyroOn
+  long  rateHz                                                  ' nominal rate of the chosen ODR
+  long  recBytes
+
+  long  cmd                                                     ' written by caller, cleared by cog
+  long  state                                                   ' written by cog
+
+  long  pBuf
+  long  maxSamples
+  long  count
+
+
+pub null()
+
+'' This is not a top object
+
+
+pub start(clickBasePin, sampleRateHz, accelFullScale, withGyro) : ok
+
+'' Launch the capture cog and configure the sensor; returns true when ready to capture
+'' -- clickBasePin: Click adapter base pin (0, 16, 32 or 48)
+'' -- sampleRateHz: requested rate; the next LSM6DSL rate at or above it is used (see actualRateHz())
+''    0 selects RATE_HZ_DEFAULT
+'' -- accelFullScale: ACCEL_FS_*
+'' -- withGyro: true to capture gyro X/Y/Z too (+-250 dps, same rate)
+
+  stop()
+
+  if sampleRateHz <= 0
+    sampleRateHz := RATE_HZ_DEFAULT
+  odr, rateHz := pickOdr(sampleRateHz)
+  basePin := clickBasePin
+  accelFs := accelFullScale
+  gyroOn := withGyro
+  recBytes := withGyro ? SAMPLE_BYTES_ACCEL_GYRO : SAMPLE_BYTES_ACCEL
+  count := 0
+  cmd := CMD_NONE
+  state := ST_INIT
+
+  captureCogPlus1 := cogspin(NEWCOG, captureCog(), @stack) + 1
+  if captureCogPlus1 == 0
+    return false
+
+  repeat while state == ST_INIT
+  if state <> ST_READY
+    stop()
+    return false
+
+  ok := true
+
+
+pub stop()
+
+'' Shut the capture cog down; it releases the sensor and pins itself
+
+  if captureCogPlus1
+    cmd := CMD_SHUTDOWN
+    repeat until state == ST_OFF
+    cogstop(captureCogPlus1 - 1)
+    captureCogPlus1 := 0
+
+
+pub startCapture(pBuffer, nSamples) : ok
+
+'' Begin filling pBuffer with up to nSamples records (sampleBytes() each)
+'' -- returns false if not ready (not started, or a capture is already running)
+
+  if (state <> ST_READY) || (nSamples <= 0)
+    return false
+
+  pBuf := pBuffer
+  maxSamples := nSamples
+  count := 0
+  cmd := CMD_CAPTURE
+  repeat while cmd == CMD_CAPTURE                               ' cog accepts: state -> CAPTURING
+  ok := true
+
+
+pub stopCapture()
+
+'' End a capture early; returns once the cog has stopped writing
+
+  if state == ST_CAPTURING
+    cmd := CMD_STOPCAP
+    repeat while state == ST_CAPTURING
+
+
+pub isCapturing() : capturing
+
+'' True while samples are being written
+
+  capturing := (state == ST_CAPTURING)
+
+
+pub sampleCount() : n
+
+'' Number of records written so far in the current or last capture
+
+  n := count
+
+
+pub sampleBytes() : nBytes
+
+'' Bytes per buffer record for the current configuration
+
+  nBytes := recBytes
+
+
+pub actualRateHz() : hz
+
+'' Nominal LSM6DSL rate in use (12 means 12.5 Hz); CT offsets give the measured rate
+
+  hz := rateHz
+
+
+pub getSample(index) : ctOffset, ax, ay, az | p
+
+'' Returns the CT offset (clocks since first sample) and raw accel X/Y/Z of record index
+
+  p := pBuf + index * recBytes
+  ctOffset := long[p]
+  ax := word[p + 4] signx 15
+  ay := word[p + 6] signx 15
+  az := word[p + 8] signx 15
+
+
+pub getGyro(index) : gx, gy, gz | p
+
+'' Returns raw gyro X/Y/Z of record index (0 if the gyro wasn't enabled)
+
+  if not gyroOn
+    return
+  p := pBuf + index * recBytes
+  gx := word[p + 10] signx 15
+  gy := word[p + 12] signx 15
+  gz := word[p + 14] signx 15
+
+
+pub accelMicroG(raw) : ug
+
+'' Convert raw accel counts to micro-g at the configured full scale
+
+  ug := lsm.accelMicroG(raw)
+
+
+pub gyroMicroDps(raw) : udps
+
+'' Convert raw gyro counts to micro-degrees/second
+
+  udps := lsm.gyroMicroDps(raw)
+
+
+pri captureCog() | intPin, t, t0, p, x, y, z, raw[6]
+
+  if not lsm.start(basePin, 0)
+    state := ST_FAILED
+    repeat until cmd == CMD_SHUTDOWN
+    state := ST_OFF
+    return
+
+  lsm.setAccel(odr, accelFs)
+  lsm.setGyro(gyroOn ? odr : lsm.ODR_OFF, lsm.GYRO_FS_250DPS)
+  lsm.setDataReadyInt1(true, false, false)                      ' accel DRDY, latched until data is read
+  intPin := lsm.intPinNumber()
+  waitms(SETTLE_MS)
+  state := ST_READY
+
+  repeat
+    case cmd
+      CMD_CAPTURE:
+        state := ST_CAPTURING
+        cmd := CMD_NONE
+        readInto(@raw)                                          ' clear any stale data-ready
+        repeat while (count < maxSamples) && (cmd <> CMD_STOPCAP)
+          repeat until pinread(intPin)                          ' new sample ready
+          t := getct()
+          if count == 0
+            t0 := t
+          p := pBuf + count * recBytes
+          long[p] := t - t0
+          if gyroOn
+            lsm.readAllRaw(@raw)                                ' gx, gy, gz, ax, ay, az
+            word[p + 4] := raw[3]
+            word[p + 6] := raw[4]
+            word[p + 8] := raw[5]
+            word[p + 10] := raw[0]
+            word[p + 12] := raw[1]
+            word[p + 14] := raw[2]
+          else
+            x, y, z := lsm.readAccelRaw()
+            word[p + 4] := x
+            word[p + 6] := y
+            word[p + 8] := z
+          count++
+        if cmd == CMD_STOPCAP
+          cmd := CMD_NONE
+        state := ST_READY
+
+      CMD_STOPCAP:
+        cmd := CMD_NONE
+
+      CMD_SHUTDOWN:
+        lsm.stop()                                              ' release pins from the owning cog
+        state := ST_OFF
+        return
+
+
+pri readInto(pSix)
+
+  if gyroOn
+    lsm.readAllRaw(pSix)
+  else
+    long[pSix][3], long[pSix][4], long[pSix][5] := lsm.readAccelRaw()
+
+
+pri pickOdr(hz) : odrCode, nominalHz | idx
+
+  repeat idx from 0 to 9
+    if word[@rateTable][idx] >= hz
+      quit
+  idx <#= 9                                                     ' above 6.66 kHz: use the top rate
+  odrCode := lsm.ODR_12_5HZ + idx
+  nominalHz := word[@rateTable][idx]
+
+
+dat
+
+  rateTable     word    12, 26, 52, 104, 208, 416, 833, 1660, 3330, 6660   ' ODR_12_5HZ .. ODR_6_66KHZ
+
+
+con { license }
+
+{{
+
+  Terms of Use: MIT License
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify,
+  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following
+  conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies
+  or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+  OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+}}

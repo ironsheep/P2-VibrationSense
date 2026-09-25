@@ -1,0 +1,224 @@
+'' =================================================================================================
+''
+''   File....... isp_spi.spin2
+''   Purpose.... Smart pin SPI routines, selectable SPI mode 0-3
+''   Authors.... Jon "JonnyMac" McPhalen (original jm_ez_spi, mode 0 only)
+''               Copyright (c) 2020 Jon McPhalen
+''               Stephen M Moraco (SPI mode selection)
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''               -- see below for terms of use
+''   E-mail..... stephen@ironsheep.biz
+''   Started.... 24 SEP 2026
+''
+''   {$P2}
+''
+''   Derived from jm_ez_spi.spin2 (kept in this folder as the reference). The
+''   transfer methods are unchanged; start() adds an SPI mode parameter.
+''
+''   How the modes map onto smart pins:
+''   -- CPOL (clock idle level): SCK is a P_PULSE output, which idles low and
+''      pulses high-then-low. CPOL=1 inverts SCK's output, so it idles high and
+''      pulses low-then-high.
+''   -- Sample edge: the sync TX/RX pins shift and sample on their B-input
+''      (SCK) rising edge. Modes 0 and 3 sample on the physical rising edge, so
+''      B is used as-is. Modes 1 and 2 sample on the falling edge, so B is
+''      inverted on the data pins.
+''
+''   All pins are driven from the CALLING cog: call start() and every transfer
+''   from the same cog.
+''
+'' =================================================================================================
+
+
+con
+
+  #0, LSBFIRST, MSBFIRST
+
+  ' SPI modes: CPOL = clock idle level, CPHA = 0 samples on leading edge, 1 on trailing
+  #0, SPI_MODE_0, SPI_MODE_1, SPI_MODE_2, SPI_MODE_3            ' (CPOL<<1) | CPHA
+
+
+var
+
+  long  setup
+
+  long  sdi                                                     ' smart pin #s (-1 if not used)
+  long  sdo
+  long  sck
+
+
+pub null()
+
+'' This is not a top object
+
+
+pub start(sdipin, sdopin, sckpin, khz, spimode) : result | m, x, bInvert
+
+'' Configure P2 smart pins for SPI coms
+'' -- sdipin is input from external device (-1 if not used)
+'' -- sdopin is output to external device  (-1 if not used)
+'' -- sckpin is clock output
+'' -- khz is clock frequency in kilohertz  (1000 = 1MHz)
+'' -- spimode is SPI_MODE_0 .. SPI_MODE_3
+'' -- data pins must be within 3 pins of sckpin (smart pin B-input reach)
+
+  stop()
+
+  if ((sdipin == sdopin) || (sckpin < 0) || (spimode < SPI_MODE_0) || (spimode > SPI_MODE_3))
+    return false
+  if ((sdipin >= 0) && (abs (sckpin - sdipin) > 3))
+    return false
+  if ((sdopin >= 0) && (abs (sckpin - sdopin) > 3))
+    return false
+
+  longmove(@sdi, @sdipin, 3)                                    ' save pins
+
+  bInvert := (spimode == SPI_MODE_1 || spimode == SPI_MODE_2) ? P_INVERT_B : 0   ' sample on falling edge
+
+  if (sdi >= 0)
+    m := P_SYNC_RX | bInvert                                    ' spi rx mode
+    m |= ((sck-sdi) & %111) << 24                               ' add SCK offset (B pin)
+    x := %0_00000 | (8-1)                                       ' sample ahead of b pin rise, 8 bits
+    pinstart(sdi, m, x, 0)                                      ' configure smart pin
+    pinf(sdi)                                                   ' disable until used
+
+  if (sdo >= 0)
+    m := P_OE | P_SYNC_TX | bInvert                             ' spi tx mode
+    m |= ((sck-sdo) & %111) << 24                               ' add SCK offset (B pin)
+    x := %1_00000 | (8-1)                                       ' start/stop mode, 8 bits
+    pinstart(sdo, m, x, 0)                                      ' configure smart pin
+    pinf(sdo)                                                   ' disable until used
+
+  m := P_OE | P_PULSE                                           ' pulses for spi clock
+  if (spimode >= SPI_MODE_2)
+    m |= P_INVERT_OUTPUT                                        ' CPOL=1: idle high
+  x.word[0] := 2 #> (clkfreq / (khz*1000)) <# $FFFF             ' ticks in period
+  x.word[1] := x.word[0] >> 1                                   ' ticks in low cycle (50%)
+  pinstart(sck, m, x, 0)                                        ' configure smart pin
+
+  setup := true
+
+  return setup
+
+
+pub stop()
+
+'' Clears SPI smart pins if configured
+
+  if (setup)                                                    ' configured?
+    if (sdi >= 0)                                               ' clear smart pins
+      pinclear(sdi)
+    if (sdo >= 0)
+      pinclear(sdo)
+    pinclear(sck)
+    setup := false
+
+  longfill(@sdi, -1, 3)                                         ' mark pins as unused
+
+
+pub shiftin(mode, bits) : value
+
+'' Shift data in from a synchronous serial device
+'' -- mode is bit order: LSBFIRST or MSBFIRST
+'' -- bits in the number of bits to shift
+
+  if (sdi < 0)                                                  ' abort if di not defined
+    return 0
+
+  pinf(sdi)                                                     ' reset di
+  wxpin(sdi, %0_00000 | (bits-1))                               ' configure di sampling/bits
+  pinl(sdi)                                                     ' enable di
+  wypin(sck, bits)                                              ' start clocking data
+  repeat until pinr(sck)                                        ' wait until clocks finished
+
+  value := rdpin(sdi)                                           ' get value
+
+  if (mode == LSBFIRST)
+    value >>= (32-bits)                                         ' align lsb
+  else
+    value rev= 31                                               ' flip to align lsb
+    if (bits < 32)                                              ' clear unused bits
+      value zerox= (bits-1)
+
+
+pub shiftout(mode, value, bits)
+
+'' Shift data out to a synchronous serial device
+'' -- mode is bit order: LSBFIRST or MSBFIRST
+'' -- value is shifted out
+'' -- bits in the number of bits to shift
+
+  if (sdo < 0)                                                  ' abort if do not defined
+    return
+
+  if (mode == MSBFIRST)                                         ' flip to output from LSB end
+    if (bits < 32)                                              ' adjust alignment if needed
+      value <<= (32-bits)
+    value rev= 31
+
+  wxpin(sdo, %1_00000 | (bits-1))                               ' configure do bits
+  wypin(sdo, value)                                             ' load value
+  pinl(sdo)                                                     ' enable do
+  wypin(sck, bits)                                              ' start clocking data
+  repeat until pinr(sck)                                        ' wait for clocking to finish
+  pinf(sdo)                                                     ' disable do
+
+
+pub shiftio(mode, outval, bits) : inval
+
+'' Shift outval to a synchronous serial device while receiving inval
+'' -- mode is bit order: LSBFIRST or MSBFIRST
+'' -- bits in the number of bits to shift
+
+  if ((sdi < 0) || (sdo < 0))                                   ' abort if di and do not defined
+    return 0
+
+  if (mode == MSBFIRST)
+    if (bits < 32)                                              ' adjust alignment if needed
+      outval <<= (32-bits)
+    outval rev= 31                                              ' flip to output from LSB end
+
+  wxpin(sdo, %1_00000 | (bits-1))                               ' configure do bits
+  wypin(sdo, outval)                                            ' load value
+  pinl(sdo)                                                     ' enable do
+  pinf(sdi)                                                     ' reset di
+  wxpin(sdi, %0_00000 | (bits-1))                               ' configure di sampling/bits
+  pinl(sdi)                                                     ' enable di
+  wypin(sck, bits)                                              ' start clocking data
+  repeat until pinr(sck)                                        ' wait for clocking to finish
+  pinf(sdo)                                                     ' disable do
+
+  inval := rdpin(sdi)                                           ' get inval
+
+  if (mode == LSBFIRST)
+    inval >>= (32-bits)                                         ' align lsb
+  else
+    inval rev= 31                                               ' flip to align lsb
+    if (bits < 32)                                              ' clear unused bits
+      inval zerox= (bits-1)
+
+
+con { license }
+
+{{
+
+  Terms of Use: MIT License
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify,
+  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following
+  conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies
+  or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+  OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+}}
