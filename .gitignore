@@ -229,3 +229,5 @@ CLAUDE.local.md
 # P2 build output and pnut-term-ts run logs
 *.bin
 logs/
+/.github/.history
+*.gz
