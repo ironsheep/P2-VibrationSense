@@ -1,0 +1,320 @@
+'' =================================================================================================
+''
+''   File....... vibration_demo.spin2
+''   Purpose.... Capture vibration with both sensors at once, then report what was learned:
+''               per-channel level / RMS / peak (with clipping warnings), the strongest
+''               frequencies in the most active part of the capture, and how the dominant
+''               frequency changed over time
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+''   Channels: piezo (P0, mV; frequency only, uncalibrated amplitude) and the LSM6DSL
+''   accelerometer X / Y / Z (mg). Frequencies use each sensor's rate measured from its CT
+''   timestamps. Values print with one decimal place.
+''
+'' =================================================================================================
+
+
+con { timing }
+
+  CLK_FREQ = 200_000_000                                        ' system freq as a constant
+  _clkfreq = CLK_FREQ                                           ' set system clock
+
+
+con { app io pins }
+
+  PIEZO_PIN  = 0
+  CLICK_BASE = 32                                               ' LSM6DSL Click adapter on P32-P47
+
+
+con { capture settings }
+
+  IMU_RATE_HZ   = 1660                                          ' nominal; measures ~1,732 Hz on our board
+  PIEZO_RATE_HZ = 2000                                          ' -> 2,034.5 Hz
+  CAPTURE_MS    = 8000
+  IMU_MAX       = 14400                                         ' room for 8.3 s at 1,732 Hz
+  PIEZO_MAX     = 16640                                         ' room for 8.2 s at 2,034.5 Hz
+
+  CLIP_RAW      = 32760                                         ' |raw accel| at or above this = clipped
+
+  SEGMENT_N     = 1024                                          ' FFT per segment for the timeline
+  WINDOW_SEGS   = 4                                             ' strongest-frequency window = 4 segments
+  MAX_SEGMENTS  = 20
+  QUIET_RATIO   = 2.0                                           ' quiet if segment RMS < 2x quietest segment
+
+  #0, CH_PIEZO, CH_X, CH_Y, CH_Z
+  CHANNELS = 4
+
+
+obj
+
+  imu   : "isp_imu_capture"
+  piezo : "isp_piezo_capture"
+  fft   : "isp_fft"
+
+
+var
+
+  byte  imuBuf[IMU_MAX * imu.SAMPLE_BYTES_ACCEL]
+  byte  piezoBuf[PIEZO_MAX * piezo.SAMPLE_BYTES]
+
+  long  imuRate                                                 ' measured rates, float Hz
+  long  piezoRate
+
+  long  chMean[CHANNELS]                                        ' float, channel units
+  long  chFloor[CHANNELS]                                       ' float, quietest segment RMS
+  long  chLoudStart[CHANNELS]                                   ' first sample of the most active window
+  long  segRms[CHANNELS * MAX_SEGMENTS]                         ' float, per segment
+
+
+pub main() | ch
+
+  fft.init()
+
+  if not piezo.start(PIEZO_PIN, PIEZO_RATE_HZ)
+    debug("piezo start FAILED")
+    finish()
+    return
+  if not imu.start(CLICK_BASE, IMU_RATE_HZ, imu.ACCEL_FS_8G, false)
+    debug("IMU start FAILED")
+    piezo.stop()
+    finish()
+    return
+
+  debug("=== P2 vibration demo ===")
+  debug("capturing ", udec_(CAPTURE_MS / 1000), " s: piezo ", udec_(piezo.actualRateHz()), " Hz, accel ", udec_(imu.actualRateHz()), " Hz nominal, +-8 g")
+
+  piezo.startCapture(@piezoBuf, PIEZO_MAX)
+  imu.startCapture(@imuBuf, IMU_MAX)
+  waitms(CAPTURE_MS)
+  imu.stopCapture()
+  piezo.stopCapture()
+
+  piezoRate := measuredRate(CH_PIEZO)
+  imuRate := measuredRate(CH_X)
+  debug("captured: piezo ", udec_(piezo.sampleCount()), " samples at ", udec_(tenths(piezoRate) / 10), ".", udec_(tenths(piezoRate) // 10), " Hz;", {
+    } " accel ", udec_(imu.sampleCount()), " samples at ", udec_(tenths(imuRate) / 10), ".", udec_(tenths(imuRate) // 10), " Hz (measured)")
+
+  repeat ch from CH_PIEZO to CH_Z
+    prepareChannel(ch)
+
+  debug("--- level and vibration size (mean removed) ---")
+  repeat ch from CH_PIEZO to CH_Z
+    reportLevels(ch)
+
+  debug("--- strongest frequencies (most active ", udec_(WINDOW_SEGS * SEGMENT_N), " samples of each channel) ---")
+  repeat ch from CH_PIEZO to CH_Z
+    reportSpectrum(ch)
+
+  debug("--- dominant frequency over time (", udec_(SEGMENT_N), "-sample segments; quiet = RMS under 2x the quietest segment) ---")
+  reportTimeline(CH_PIEZO)
+  reportTimelineImu()
+
+  imu.stop()
+  piezo.stop()
+  finish()
+
+
+pri prepareChannel(ch) | n, i, sum, seg, segments, dev, sumSq, best, bestEnergy, energy, k
+
+'' Channel mean, per-segment RMS, quietest-segment floor, and the most active window
+
+  n := channelCount(ch)
+  sum := 0.0
+  repeat i from 0 to n - 1
+    sum := sum +. channelValue(ch, i)
+  chMean[ch] := sum /. float(n)
+
+  segments := segmentCount(ch)
+  chFloor[ch] := 1.0e30
+  repeat seg from 0 to segments - 1
+    sumSq := 0.0
+    repeat i from seg * SEGMENT_N to seg * SEGMENT_N + SEGMENT_N - 1
+      dev := channelValue(ch, i) -. chMean[ch]
+      sumSq := sumSq +. dev *. dev
+    segRms[ch * MAX_SEGMENTS + seg] := fsqrt(sumSq /. float(SEGMENT_N))
+    if segRms[ch * MAX_SEGMENTS + seg] <. chFloor[ch]
+      chFloor[ch] := segRms[ch * MAX_SEGMENTS + seg]
+
+  chLoudStart[ch] := 0                                          ' most active run of WINDOW_SEGS segments
+  if segments > WINDOW_SEGS
+    bestEnergy := -1.0
+    repeat best from 0 to segments - WINDOW_SEGS
+      energy := 0.0
+      repeat k from best to best + WINDOW_SEGS - 1
+        energy := energy +. segRms[ch * MAX_SEGMENTS + k] *. segRms[ch * MAX_SEGMENTS + k]
+      if energy >. bestEnergy
+        bestEnergy := energy
+        chLoudStart[ch] := best * SEGMENT_N
+
+
+pri reportLevels(ch) | n, i, dev, sumSq, peakDev, peakIdx, clipped
+
+'' RMS and peak deviation for one channel, plus clipped-sample count for accel axes
+
+  n := channelCount(ch)
+  sumSq := 0.0
+  peakDev := 0.0
+  peakIdx := 0
+  clipped := 0
+  repeat i from 0 to n - 1
+    dev := fabs(channelValue(ch, i) -. chMean[ch])
+    sumSq := sumSq +. dev *. dev
+    if dev >. peakDev
+      peakDev := dev
+      peakIdx := i
+    if ch <> CH_PIEZO
+      if abs channelRaw(ch, i) >= CLIP_RAW
+        clipped++
+
+  debug("  ", zstr_(channelName(ch)), ": level ", sdec_(trunc(chMean[ch])), " ", zstr_(channelUnit(ch)), {
+    } "  RMS ", udec_(tenths(fsqrt(sumSq /. float(n))) / 10), ".", udec_(tenths(fsqrt(sumSq /. float(n))) // 10), {
+    } "  peak ", udec_(tenths(peakDev) / 10), ".", udec_(tenths(peakDev) // 10), " ", zstr_(channelUnit(ch)), {
+    } " at ", udec_(trunc(float(peakIdx) *. 1000.0 /. channelRate(ch))), " ms")
+  if clipped
+    debug("    WARNING: ", zstr_(channelName(ch)), " CLIPPED on ", udec_(clipped), " samples; readings at the limit understate the vibration (try a larger range)")
+
+
+pri reportSpectrum(ch) | n, start, i, r, hz, amp, startMs, endMs
+
+'' Top spectral peaks over the most active window of the capture
+
+  n := powerOfTwoAtMost(channelCount(ch) <# (WINDOW_SEGS * SEGMENT_N))
+  start := chLoudStart[ch]
+  repeat i from 0 to n - 1
+    fft.setSample(i, channelValue(ch, start + i))
+  fft.analyze(n, channelRate(ch))
+  startMs := trunc(float(start) *. 1000.0 /. channelRate(ch))
+  endMs := trunc(float(start + n) *. 1000.0 /. channelRate(ch))
+
+  if fft.peakCount() == 0
+    debug("  ", zstr_(channelName(ch)), " (", udec_(startMs), "-", udec_(endMs), " ms): no peaks")
+    return
+  repeat r from 0 to fft.peakCount() - 1
+    hz, amp := fft.peak(r)
+    debug("  ", zstr_(channelName(ch)), " (", udec_(startMs), "-", udec_(endMs), " ms) #", udec_(r + 1), ": ", udec_(tenths(hz) / 10), ".", udec_(tenths(hz) // 10), " Hz", {
+      } "  amplitude ", udec_(tenths(amp) / 10), ".", udec_(tenths(amp) // 10), " ", zstr_(channelUnit(ch)), {
+      } "   (resolution ", udec_(tenths(fft.binHz(channelRate(ch))) / 10), ".", udec_(tenths(fft.binHz(channelRate(ch))) // 10), " Hz)")
+
+
+pri reportTimeline(ch) | seg, i, hz, amp, startMs, rms
+
+'' Dominant frequency and its amplitude in each non-quiet segment of one channel
+
+  repeat seg from 0 to segmentCount(ch) - 1
+    startMs := trunc(float(seg * SEGMENT_N) *. 1000.0 /. channelRate(ch))
+    rms := segRms[ch * MAX_SEGMENTS + seg]
+    if isQuiet(ch, seg)
+      debug("  ", zstr_(channelName(ch)), " ", udec_(startMs), " ms: quiet (RMS ", udec_(tenths(rms) / 10), ".", udec_(tenths(rms) // 10), " ", zstr_(channelUnit(ch)), ")")
+      next
+    repeat i from 0 to SEGMENT_N - 1
+      fft.setSample(i, channelValue(ch, seg * SEGMENT_N + i))
+    fft.analyze(SEGMENT_N, channelRate(ch))
+    if fft.peakCount()
+      hz, amp := fft.peak(0)
+      debug("  ", zstr_(channelName(ch)), " ", udec_(startMs), " ms: ", udec_(tenths(hz) / 10), ".", udec_(tenths(hz) // 10), " Hz", {
+        } " at ", udec_(tenths(amp) / 10), ".", udec_(tenths(amp) // 10), " ", zstr_(channelUnit(ch)), {
+        } "  (RMS ", udec_(tenths(rms) / 10), ".", udec_(tenths(rms) // 10), ")")
+
+
+pri reportTimelineImu() | seg, ch, i, hz[3], amp[3], startMs
+
+'' One line per segment with the dominant frequency of each accel axis; quiet when all three are
+
+  repeat seg from 0 to segmentCount(CH_X) - 1
+    startMs := trunc(float(seg * SEGMENT_N) *. 1000.0 /. imuRate)
+    if isQuiet(CH_X, seg) && isQuiet(CH_Y, seg) && isQuiet(CH_Z, seg)
+      debug("  accel ", udec_(startMs), " ms: quiet")
+      next
+    repeat ch from CH_X to CH_Z
+      repeat i from 0 to SEGMENT_N - 1
+        fft.setSample(i, channelValue(ch, seg * SEGMENT_N + i))
+      fft.analyze(SEGMENT_N, imuRate)
+      hz[ch - CH_X], amp[ch - CH_X] := fft.peak(0)
+    debug("  accel ", udec_(startMs), " ms: X ", udec_(tenths(hz[0]) / 10), ".", udec_(tenths(hz[0]) // 10), " Hz @ ", udec_(tenths(amp[0]) / 10), ".", udec_(tenths(amp[0]) // 10), {
+      } "  Y ", udec_(tenths(hz[1]) / 10), ".", udec_(tenths(hz[1]) // 10), " Hz @ ", udec_(tenths(amp[1]) / 10), ".", udec_(tenths(amp[1]) // 10), {
+      } "  Z ", udec_(tenths(hz[2]) / 10), ".", udec_(tenths(hz[2]) // 10), " Hz @ ", udec_(tenths(amp[2]) / 10), ".", udec_(tenths(amp[2]) // 10), " mg")
+
+
+pri isQuiet(ch, seg) : quiet
+
+  quiet := segRms[ch * MAX_SEGMENTS + seg] <. QUIET_RATIO *. chFloor[ch]
+
+
+pri channelValue(ch, index) : value | ct, uv
+
+'' Float sample: piezo in mV, accel axes in mg
+
+  if ch == CH_PIEZO
+    ct, uv := piezo.getSample(index)
+    value := float(uv) /. 1000.0
+  else
+    value := float(imu.accelMicroG(channelRaw(ch, index))) /. 1000.0
+
+
+pri channelRaw(ch, index) : raw | ct, ax, ay, az
+
+'' Raw accel counts for an accel channel
+
+  ct, ax, ay, az := imu.getSample(index)
+  raw := lookupz(ch - CH_X : ax, ay, az)
+
+
+pri channelCount(ch) : n
+
+  n := (ch == CH_PIEZO) ? piezo.sampleCount() : imu.sampleCount()
+
+
+pri segmentCount(ch) : segments
+
+  segments := (channelCount(ch) / SEGMENT_N) <# MAX_SEGMENTS
+
+
+pri channelRate(ch) : hz
+
+  hz := (ch == CH_PIEZO) ? piezoRate : imuRate
+
+
+pri measuredRate(ch) : hz | n, ct, a, b, c
+
+'' Sample rate from the first and last CT offsets (float Hz)
+
+  n := channelCount(ch)
+  if ch == CH_PIEZO
+    ct, a := piezo.getSample(n - 1)
+  else
+    ct, a, b, c := imu.getSample(n - 1)
+  hz := float(n - 1) /. (float(ct) /. float(clkfreq))
+
+
+pri channelName(ch) : pStr
+
+  pStr := lookupz(ch : @"piezo", @"accel X", @"accel Y", @"accel Z")
+
+
+pri channelUnit(ch) : pStr
+
+  pStr := (ch == CH_PIEZO) ? @"mV" : @"mg"
+
+
+pri tenths(value) : t
+
+'' Float -> integer tenths, rounded, for one-decimal printing
+
+  t := trunc(value *. 10.0 +. 0.5)
+
+
+pri powerOfTwoAtMost(n) : p
+
+  p := 1
+  repeat while p * 2 <= n
+    p *= 2
+
+
+pri finish()
+
+  waitms(100)
+  debug("END_SESSION")

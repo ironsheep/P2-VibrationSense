@@ -7,7 +7,7 @@ The project provides two independent Spin2 driver objects, one per sensor. Each 
 - **Piezo sensor:** the vibration's frequency. The piezo gives no direction.
 - **6DOF IMU:** the vibration's size (in g) and frequency along each of X, Y and Z.
 
-> **Status:** early development. Both capture objects work on hardware: the IMU at 1.66 kHz and the piezo at 2 kHz, with no missed samples. The demo and its frequency analysis are not written yet. The interface may still change.
+> **Status:** early development. Both capture objects and the demo work on hardware: the IMU at 1.66 kHz and the piezo at 2 kHz with no missed samples, and the demo reports levels, frequencies and a timeline from an 8 s capture. The interface may still change.
 
 ## The two driver objects
 
@@ -76,7 +76,7 @@ VAR
   byte  buf[1660 * imu.SAMPLE_BYTES_ACCEL]                     ' ~1 s at 1.66 kHz, accel only
 
 PUB main() | i, ct, ax, ay, az
-  imu.start(32, 1660, imu.ACCEL_FS_4G, false)                  ' base pin, rate, range, gyro?
+  imu.start(32, 1660, imu.ACCEL_FS_8G, false)                  ' base pin, rate, range, gyro?
   imu.startCapture(@buf, 1660)
   repeat while imu.isCapturing()
   repeat i from 0 to imu.sampleCount() - 1
@@ -114,11 +114,21 @@ The code is Spin2 for the P2 and builds with [PNut-TS](https://github.com/ironsh
 
 ```
 cd src
-pnut-ts -d lsm6dsl_test.spin2
-pnut-term-ts --headless -r lsm6dsl_test.bin --end-marker --timeout 30
+pnut-ts -d vibration_demo.spin2
+pnut-term-ts --headless -r vibration_demo.bin --end-marker --timeout 120
 ```
 
-Test programs in `src/`:
+### The demo
+
+`vibration_demo.spin2` starts both capture objects, captures 8 s (thump or shake the platform during it), and prints a report:
+
+- **Level and vibration size** per channel (piezo, accel X/Y/Z): resting level, RMS, peak swing and when it happened, with a warning if the accelerometer clipped.
+- **Strongest frequencies:** the top 3 frequencies and amplitudes in the most active ~2 s of each channel.
+- **Dominant frequency over time:** per ~0.5 s segment, the dominant frequency and its amplitude, or "quiet".
+
+Frequencies are computed from each sensor's measured sample rate. The analysis uses [`src/isp_fft.spin2`](src/isp_fft.spin2), a Spin2 FFT object with a Hann window and between-bin refinement of frequency and amplitude.
+
+### Test programs in `src/`
 
 | Program | What it checks |
 | ------- | -------------- |
@@ -127,11 +137,12 @@ Test programs in `src/`:
 | `piezo_test.spin2` | Piezo bring-up: GIO/VIO calibration, resting level and noise, and the pin's recovery after a source switch |
 | `piezo_thump_test.spin2` | Waits up to 30 s for a desk thump, captures 1 s at 24.4 kHz: peak swing, decay per 50 ms, frequency estimate |
 | `piezo_capture_test.spin2` | ~1 s capture at 2 kHz: measured rate, sample-interval jitter, missed samples, level and noise |
+| `fft_test.spin2` | `isp_fft` on synthetic tones (50 Hz and 123.4 Hz plus a DC offset): found frequencies and amplitudes, and analysis time for 1,024 / 2,048 / 4,096 points |
 
 ## Documentation
 
 - [`HARDWARE.md`](HARDWARE.md): wiring and pinout
-- [`DOCs/DESIGN-GOALS.md`](DOCs/DESIGN-GOALS.md): design goals, driver structure and planned analysis
+- [`DOCs/DESIGN-GOALS.md`](DOCs/DESIGN-GOALS.md): design goals, driver structure, sample-rate choices, measured sensor behavior and the demo's analysis
 - [`DOCs/hardware/`](DOCs/hardware/): LSM6DSL Click sheet and the ST LSM6DSL datasheet
 
 ## License

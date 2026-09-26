@@ -1,0 +1,66 @@
+'' =================================================================================================
+''
+''   File....... fft_test.spin2
+''   Purpose.... Verify isp_fft on a synthetic signal with known frequencies and amplitudes,
+''               and time the analysis
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+'' =================================================================================================
+
+
+con { timing }
+
+  CLK_FREQ = 200_000_000                                        ' system freq as a constant
+  _clkfreq = CLK_FREQ                                           ' set system clock
+
+
+con { test signal }
+
+  RATE_HZ = 1732.0                                              ' like the IMU's measured rate
+  TONE1_HZ = 50.0
+  TONE1_AMP = 10.0
+  TONE2_HZ = 123.4
+  TONE2_AMP = 3.0
+  OFFSET = 1000.0                                               ' DC, like gravity; should be removed
+
+
+obj
+
+  fft : "isp_fft"
+
+
+pub main() | n, i, t, x, r, hz, amp, elapsed
+
+  fft.init()
+
+  n := 1024
+  repeat while n <= fft.MAX_N
+    repeat i from 0 to n - 1
+      t := float(i) /. RATE_HZ
+      x := OFFSET +. TONE1_AMP *. sine(TONE1_HZ *. t) +. TONE2_AMP *. sine(TONE2_HZ *. t)
+      fft.setSample(i, x)
+
+    elapsed := getct()
+    fft.analyze(n, RATE_HZ)
+    elapsed := getct() - elapsed
+
+    debug("n=", udec_(n), "  analyze took ", udec_(elapsed / (clkfreq / 1000)), " ms  bin=", udec_(trunc(fft.binHz(RATE_HZ) *. 1000.0)), " mHz")
+    repeat r from 0 to fft.peakCount() - 1
+      hz, amp := fft.peak(r)
+      debug("  peak ", udec_(r), ": ", udec_(trunc(hz *. 100.0)), " cHz  amplitude x1000 = ", udec_(trunc(amp *. 1000.0)))
+    n <<= 1
+
+  waitms(100)
+  debug("END_SESSION")
+
+
+pri sine(cycles) : s | fraction
+
+'' sin(2*pi*cycles) as a float, via CORDIC
+
+  fraction := cycles -. float(trunc(cycles))                    ' 0 <= fraction < 1
+  s := float(qsin(1 << 30, trunc(fraction *. 1_000_000.0), 1_000_000)) /. 1073741824.0

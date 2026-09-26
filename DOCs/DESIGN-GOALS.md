@@ -35,7 +35,7 @@ All of these sweep up from 0 during startup and back down during spin-down.
 
 | Sensor | 6.5" hub motor | Faster motors |
 | ------ | -------------- | ------------- |
-| IMU accelerometer | **1.66 kHz** (833 Hz bandwidth, covers the 675 Hz commutation ripple), ±4 g | 1.66–3.33 kHz (up to the chip's 1.5 kHz analog bandwidth), ±8 g |
+| IMU accelerometer | **1.66 kHz** (833 Hz bandwidth, covers the 675 Hz commutation ripple), **±8 g** (±4 g clipped on desk thumps) | 1.66–3.33 kHz (up to the chip's 1.5 kHz analog bandwidth), ±8 g |
 | IMU gyro | optional, same rate | optional |
 | Piezo | **1–2 kHz** | 5–10 kHz |
 
@@ -133,18 +133,32 @@ The top-level demo:
 4. Stops them.
 5. Displays the samples with an analysis of what was learned.
 
+Implemented as `src/vibration_demo.spin2`, with the frequency analysis in `src/isp_fft.spin2`. It captures 8 s (piezo 2,034.5 Hz; accel 1.66 kHz nominal at **±8 g**) and prints a text report through `DEBUG`.
+
 ### Analysis
 
-| Sensor | Reports |
-| ------ | ------- |
-| Piezo | Dominant frequency or frequencies. Any amplitude is only relative, because the sensor is uncalibrated. |
-| IMU | For each of X, Y and Z: dominant frequency, plus vibration size in g (peak and RMS). |
+Each channel's mean is removed first, which also removes gravity on the IMU axes (about 1 g on one axis at rest). The report has three sections:
 
-Before analysis, the IMU's per-axis average is subtracted to remove gravity (about 1 g on one axis at rest).
+| Section | Contents |
+| ------- | -------- |
+| Level and vibration size | Per channel: resting level, RMS, peak swing and when it happened. Accel axes warn when samples **clip** (hit the range limit). |
+| Strongest frequencies | Top 3 peaks (frequency and amplitude) in the **most active** 4,096 samples of each channel. |
+| Dominant frequency over time | Per 1,024-sample segment (~0.5–0.6 s): dominant frequency and amplitude, or **quiet** when the segment's RMS is under 2× the channel's quietest segment. |
+
+Piezo amplitudes are in mV and only relative (the sensor is uncalibrated); accel amplitudes are in mg.
+
+`isp_fft` is a radix-2 FFT in Spin2 floats with a Hann window. Frequency and amplitude are refined between bins by parabolic interpolation. On synthetic tones (`src/fft_test.spin2`) it found frequencies within 0.05 Hz and amplitudes within ~2% (5.6% worst at n = 1,024). A 4,096-point analysis takes ~0.76 s.
+
+### What the demo showed on a desk (2026-09-25)
+
+- **Quiet desk:** 60 Hz in the piezo (~1.3 mV, likely mains pickup) and 120 Hz on all accel axes (~1 mg, twice mains frequency, likely a transformer or fan nearby).
+- **Thumps:** the desk rings at ~34 Hz side to side (X/Y) and ~63 Hz vertically (Z). The piezo's dominant frequency during thumps (34–35 Hz) matched the accelerometer's.
+- **Hand shaking:** 6–9 Hz at 25–48 mg on X/Y; the piezo didn't register it.
+- **Range:** hard thumps swung Z by 5–7 g, clipping at ±4 g and briefly even at ±8 g. The default is now ±8 g; ±16 g would suit hard impacts at the cost of more noise (130 vs 90 µg/√Hz).
 
 ## Open questions
 
-1. **Output:** Spin2 `DEBUG` (text or graphical windows), or a serial terminal?
+1. **Output:** plain `DEBUG` text is implemented. Graphical `DEBUG` windows (live waveform and spectrum plots in PNut-Term-TS) could be added.
 2. **Capture length:** how long does one startup plus spin-down take? This sets buffer sizes; a single capture must stay under ~21 s (CT wrap).
 3. **Units:** is vibration size in g enough, or is velocity (mm/s) also wanted?
 4. **Gyro:** capture the gyro axes too, or accelerometer only?

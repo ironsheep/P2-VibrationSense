@@ -1,0 +1,207 @@
+'' =================================================================================================
+''
+''   File....... isp_fft.spin2
+''   Purpose.... Spectrum analysis of captured vibration samples: mean removal, Hann window,
+''               radix-2 FFT (Spin2 floats), and the strongest spectral peaks
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''               -- see below for terms of use
+''   E-mail..... stephen@ironsheep.biz
+''   Started.... 25 SEP 2026
+''
+''   {$P2}
+''
+''   Usage: init() once; setSample(i, value) for i = 0 .. n-1 (float values, any unit);
+''   analyze(n, sampleRateHz); then peakCount() and peak(rank).
+''
+''   Peak amplitudes are the amplitude (0-to-peak) of a sinusoid at that frequency, in the
+''   units of the input samples. Frequency and amplitude are refined between FFT bins by
+''   parabolic interpolation (verified with fft_test.spin2).
+''
+'' =================================================================================================
+
+
+con { public }
+
+  MAX_N     = 4096                                              ' largest FFT size (power of 2)
+  MAX_PEAKS = 3
+  MIN_HZ    = 2                                                 ' ignore peaks below this
+
+
+var
+
+  long  re[MAX_N]                                               ' float working arrays
+  long  im[MAX_N]
+  long  cosT[MAX_N / 2 + 1]                                     ' cos/sin(2*pi*m/MAX_N)
+  long  sinT[MAX_N / 2 + 1]
+
+  long  nCur
+  long  peakHz[MAX_PEAKS]                                       ' floats
+  long  peakAmp[MAX_PEAKS]                                      ' floats
+  long  peakBin[MAX_PEAKS]
+  long  nPeaks
+
+
+pub null()
+
+'' This is not a top object
+
+
+pub init() | m
+
+'' Build the twiddle table (call once)
+
+  repeat m from 0 to MAX_N / 2
+    cosT[m] := float(qcos(1 << 30, m, MAX_N)) /. 1073741824.0
+    sinT[m] := float(qsin(1 << 30, m, MAX_N)) /. 1073741824.0
+
+
+pub setSample(index, value)
+
+'' Load one float sample
+
+  re[index] := value
+  im[index] := 0.0
+
+
+pub analyze(n, sampleRateHz) | i, sum, mean, stride, w, k, mag, minBin
+
+'' Remove the mean, apply a Hann window, FFT, and find the strongest peaks
+'' -- n: number of loaded samples; must be a power of 2, <= MAX_N
+'' -- sampleRateHz: float, the measured sample rate
+
+  nCur := n
+  stride := MAX_N / n
+
+  sum := 0.0
+  repeat i from 0 to n - 1
+    sum := sum +. re[i]
+  mean := sum /. float(n)
+
+  repeat i from 0 to n - 1                                      ' periodic Hann: 0.5 - 0.5 cos(2 pi i / n)
+    w := 0.5 -. 0.5 *. cosT[(i <= n / 2 ? i : n - i) * stride]
+    re[i] := (re[i] -. mean) *. w
+
+  fft(n)
+
+  repeat k from 0 to n / 2                                      ' sinusoid amplitude = 4 |X| / n (Hann gain 0.5)
+    mag := fsqrt(re[k] *. re[k] +. im[k] *. im[k])
+    re[k] := 4.0 *. mag /. float(n)
+
+  minBin := 2 #> ((MIN_HZ * n + trunc(sampleRateHz) - 1) / trunc(sampleRateHz))
+  findPeaks(minBin, sampleRateHz)
+
+
+pub peakCount() : count
+
+'' Number of peaks found by the last analyze() (0 .. MAX_PEAKS)
+
+  count := nPeaks
+
+
+pub peak(rank) : hz, amplitude
+
+'' Frequency (float Hz) and amplitude (float, input units) of peak rank (0 = strongest)
+
+  hz := peakHz[rank]
+  amplitude := peakAmp[rank]
+
+
+pub binHz(sampleRateHz) : hz
+
+'' FFT frequency resolution (float Hz) of the last analyze()
+
+  hz := sampleRateHz /. float(nCur)
+
+
+pri fft(n) | i, j, bitMask, len, half, stride, k, a, b, wr, wi, tr, ti, t
+
+  j := 0                                                        ' bit-reversal permutation
+  repeat i from 1 to n - 1
+    bitMask := n >> 1
+    repeat while j & bitMask
+      j ^= bitMask
+      bitMask >>= 1
+    j ^= bitMask
+    if i < j
+      t := re[i]
+      re[i] := re[j]
+      re[j] := t
+      t := im[i]
+      im[i] := im[j]
+      im[j] := t
+
+  len := 2
+  repeat while len <= n
+    half := len >> 1
+    stride := MAX_N / len
+    repeat i from 0 to n - 1 step len
+      repeat k from 0 to half - 1
+        wr := cosT[k * stride]
+        wi := -. sinT[k * stride]
+        a := i + k
+        b := a + half
+        tr := re[b] *. wr -. im[b] *. wi
+        ti := re[b] *. wi +. im[b] *. wr
+        re[b] := re[a] -. tr
+        im[b] := im[a] -. ti
+        re[a] := re[a] +. tr
+        im[a] := im[a] +. ti
+    len <<= 1
+
+
+pri findPeaks(minBin, sampleRateHz) | k, m, r, s, left, right, denom, delta
+
+  nPeaks := 0
+  repeat k from minBin to nCur / 2 - 1
+    m := re[k]
+    if (m >. re[k - 1]) && (m >=. re[k + 1])                    ' local maximum
+      r := 0                                                    ' find its rank
+      repeat while (r < nPeaks) && (m <=. peakAmp[r])
+        r++
+      if r < MAX_PEAKS
+        s := nPeaks <# (MAX_PEAKS - 1)                          ' shift weaker peaks down
+        repeat while s > r
+          peakAmp[s] := peakAmp[s - 1]
+          peakBin[s] := peakBin[s - 1]
+          s--
+        peakAmp[r] := m
+        peakBin[r] := k
+        nPeaks := (nPeaks + 1) <# MAX_PEAKS
+
+  r := 0                                                        ' parabolic interpolation between bins
+  repeat while r < nPeaks
+    k := peakBin[r]
+    left := re[k - 1]
+    right := re[k + 1]
+    denom := left -. 2.0 *. peakAmp[r] +. right
+    delta := denom <>. 0.0 ? 0.5 *. (left -. right) /. denom : 0.0
+    peakHz[r] := (float(k) +. delta) *. sampleRateHz /. float(nCur)
+    peakAmp[r] := peakAmp[r] -. 0.25 *. (left -. right) *. delta  ' parabola's vertex height
+    r++
+
+
+con { license }
+
+{{
+
+  Terms of Use: MIT License
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify,
+  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following
+  conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies
+  or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+  OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+}}
