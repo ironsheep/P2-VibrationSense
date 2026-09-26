@@ -19,7 +19,17 @@ Sensor wiring for P2-VibrationSense on a Propeller 2 board.
 
 The sensor is powered from the same header, and so the same pin group, as its signal pin.
 
-The sensor has an on-board amplifier and puts out an analog voltage. There is no usable datasheet, so its output bias, gain and bandwidth are unknown and must be measured on the bench.
+The sensor has an on-board amplifier and puts out an analog voltage. There is no usable datasheet, so these characteristics were measured on our setup (sensor on a desk):
+
+| Characteristic | Measured |
+| -------------- | -------- |
+| Resting output | ~1,134 mV |
+| Noise | ~1.2–1.3 mV RMS, mostly low-frequency |
+| Desk thump | up to ~250 mV swing; dies out within ~200 ms |
+| Slow motion (hand shaking, 6–9 Hz) | not registered |
+| Mains pickup | ~1.3 mV at 60 Hz |
+
+Its sensitivity (mV per g) and frequency range are still unknown.
 
 ### Reading it: P0 in ADC mode
 
@@ -34,10 +44,12 @@ The sensor has an on-board amplifier and puts out an analog voltage. There is no
 
   1. Set P0 to read GIO, throw away the first 3 samples, then average the next N. This is the ground count.
   2. Set P0 to read VIO, throw away 3 samples, then average N. This is the 3.3 V count.
-  3. Set P0 to read the pin and convert each sample with the formula above.
-  4. Repeat steps 1–2 now and then (for example between capture runs) to track drift from temperature and supply.
+  3. Set P0 to read the pin, **wait for the sensor's output to recover** (see below), then convert each sample with the formula above.
+  4. Repeat steps 1–2 now and then (for example between capture runs) to track drift from temperature and supply, but never during a capture.
 
-  After each source switch, the first 3 samples are unsettled (2 from the SINC2 filter, 1 from the analog front end). Use a 64-bit intermediate for the divide, for example Spin2 `MULDIV64`. The method comes from p2kb app note P2AN001 (`p2kbAppNoteP2an001SinglePinInstrumentationAdc`), which measured a fixed offset of up to about 9 mV that remains even after this calibration. That doesn't matter for vibration amplitude, which is AC. It only matters when reading the sensor's absolute DC bias.
+  After each source switch, the first 3 ADC samples are unsettled (2 from the SINC2 filter, 1 from the analog front end). **With this sensor, the pin itself also needs time:** after the ADC reads GIO or VIO, P0 starts near 0 V and ramps back to its resting level at about 150 mV/ms, taking ~7 ms. `isp_piezo_capture` waits 50 ms. The cause isn't known. Use a 64-bit intermediate for the divide, for example Spin2 `MULDIV64`.
+
+  `isp_piezo_capture` uses SINC2 sampling at 8,192 clocks per ADC reading (24.4 kHz at 200 MHz) and the 1x range. The 3.16x range would clip: its window is centered near 1.64 V, and the resting level is ~1.13 V. The method comes from p2kb app note P2AN001 (`p2kbAppNoteP2an001SinglePinInstrumentationAdc`), which measured a fixed offset of up to about 9 mV that remains even after this calibration. That doesn't matter for vibration amplitude, which is AC. It only matters when reading the sensor's absolute DC bias.
 - Noise on the P0–P7 3.3 V rail shows up in every reading, because it feeds both the sensor and the ADC reference.
 
 ## LSM6DSL Click (6DOF IMU)
@@ -103,4 +115,5 @@ CON
 - Adapter offsets, power and header split: p2kb `p2kbHwAddonClickAdapterAddonClickAdapter` and `p2kbArchClickModuleIntegration`. The p2kb notes say these were checked against the 64008 Rev A schematic.
 - Click-side pin meanings and jumpers: `DOCs/hardware/LSM6DSL_Click.pdf`.
 - Piezo sensor wiring and use of ADC mode: as described by the project owner. No usable datasheet exists.
+- Piezo characteristics and pin recovery: measured on our hardware (2026-09-25) with `src/piezo_test.spin2`, `src/piezo_thump_test.spin2` and `src/vibration_demo.spin2`.
 - P2 ADC behavior and power groups: p2kb `p2kbAppNoteP2an001SinglePinInstrumentationAdc` and `p2kbArchPinPowerDomains`.

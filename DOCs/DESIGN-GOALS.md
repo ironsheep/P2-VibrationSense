@@ -71,7 +71,7 @@ Two independent driver objects and one top-level demo.
 
 ```
 Demo program
-   └── IMU capture object      (capture cog: waits for data-ready on P36,
+   └── isp_imu_capture         (capture cog: waits for data-ready on P36,
          │                       grabs GETCT, stores samples in the buffer)
          └── isp_lsm6dsl        (register read/write, WHO_AM_I check, rate and
                │                  range setup, data-ready routing, 12-byte burst read)
@@ -92,23 +92,13 @@ Each driver:
 
 ### Common interface
 
-Both objects expose roughly the same calls. This sketch isn't final:
+Both objects share `start`, `startCapture`, `stopCapture`, `isCapturing`, `sampleCount`, `actualRateHz`, `getSample` and `stop`; the full list with each object's differences is in the [README](../README.md#common-interface). The piezo object returns one calibrated value per sample (µV); the IMU object returns raw per-axis counts plus conversion helpers.
 
-```
-start(basePin, sampleRateHz) : ok   ' launch cog, configure sensor, idle
-startCapture(pBuf, maxSamples)      ' begin filling buffer
-stopCapture()                       ' or it stops itself when full
-isCapturing() : bool
-sampleCount() : n
-getSample(i) : ctOffset, value(s)   ' ctOffset relative to capture start
-stop()                              ' release cog
-```
-
-The piezo driver returns one value per sample. The IMU driver returns per-axis values.
+The public methods may be called from any cog. They talk to the capture cog through a command/state handshake in shared variables; only the capture cog touches the sensor's pins.
 
 ### Sampling rules
 
-- **Even spacing.** Frequency analysis assumes a steady sample rate. The piezo cog paces itself with `WAITCT`; the IMU cog paces off the sensor's data-ready edge on P36. The CT offsets confirm the spacing and show any jitter.
+- **Even spacing.** Frequency analysis assumes a steady sample rate. The piezo cog is paced by the ADC itself (each stored sample is N back-to-back ADC readings); the IMU cog paces off the sensor's data-ready signal on P36. The CT offsets confirm the spacing and show any jitter (measured: IMU 576–578 µs, piezo 490–491 µs, no missed samples).
 - **Timestamps relative to capture start.** CT is a 32-bit counter and wraps about every 21 s at 200 MHz. Storing each offset from the capture start works for any capture shorter than that.
 - **Sample rate over twice the highest frequency of interest.** See [Target motors and sample rates](#target-motors-and-sample-rates).
 - **Buffer size.** Hub RAM is 512 KB. At the hub-motor rates, per-sample timestamps fit easily:

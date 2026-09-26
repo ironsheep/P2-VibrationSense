@@ -14,23 +14,35 @@ The project provides two independent Spin2 driver objects, one per sensor. Each 
 Both objects work the same way:
 
 1. **Start** the object. It launches its own cog and sets up the sensor.
-2. **Capture.** The cog samples the sensor at a steady rate. It stores each sample with its **CT clock offset** (P2 system-clock ticks since the capture started) into your buffer.
+2. **Capture.** The cog samples the sensor at a steady rate. It stores each sample with its **CT clock offset** (P2 system-clock ticks since the first sample of the capture) into your buffer.
 3. **Stop.** Capture ends when you stop it or when the buffer is full.
 4. **Read** the samples back and process them. Nothing is analyzed during capture, so the sampling cog does nothing but sample.
 
 Because each sample carries its own timestamp, you can check the actual sample spacing and jitter, not just assume the nominal rate.
 
-### Common interface (planned)
+### Common interface
 
-```spin2
-start(basePin, sampleRateHz) : ok   ' launch cog, configure sensor, idle
-startCapture(pBuf, maxSamples)      ' begin filling buffer
-stopCapture()                       ' or it stops itself when full
-isCapturing() : bool
-sampleCount() : n
-getSample(i) : ctOffset, value(s)   ' ctOffset relative to capture start
-stop()                              ' release cog
-```
+Both objects share these calls, and can be called from any cog:
+
+| Call | What it does |
+| ---- | ------------ |
+| `start(...) : ok` | Launch the capture cog, set up the sensor, return once ready (parameters differ; see below) |
+| `startCapture(pBuf, maxSamples) : ok` | Begin filling your buffer; stops by itself when full |
+| `stopCapture()` | End a capture early |
+| `isCapturing() : bool` | True while samples are being written |
+| `sampleCount() : n` | Samples written in the current or last capture |
+| `actualRateHz() : hz` | The rate in use (nominal for the IMU; exact for the piezo) |
+| `getSample(i) : ctOffset, value(s)` | One sample: clocks since the first sample, then the value(s) |
+| `stop()` | Release the sensor, pins and cog |
+
+Differences:
+
+| | Piezo (`isp_piezo_capture`) | IMU (`isp_imu_capture`) |
+| - | --------------------------- | ----------------------- |
+| `start` | `start(pin, sampleRateHz)` | `start(clickBasePin, sampleRateHz, accelFullScale, withGyro)` |
+| `getSample(i)` returns | `ctOffset, microvolts` | `ctOffset, ax, ay, az` (raw counts) |
+| Bytes per sample | `SAMPLE_BYTES` (8) | `SAMPLE_BYTES_ACCEL` (10) or `SAMPLE_BYTES_ACCEL_GYRO` (16); `sampleBytes()` |
+| Extras | `recalibrate()`, `calibration()`, `samplePeriodClocks()` | `getGyro(i)`, `accelMicroG(raw)`, `gyroMicroDps(raw)`, `ACCEL_FS_*` |
 
 ### Piezo capture object
 
